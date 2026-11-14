@@ -91,11 +91,18 @@ function installStartPage(root, browserDir, startPage) {
   const profile = path.join(browserDir, 'TorBrowser', 'Data', 'Browser', 'profile.default');
   fs.mkdirSync(profile, { recursive: true });
   const url = pathToFileURL(target).href;
-  fs.writeFileSync(path.join(profile, 'user.js'), [
-    '// Создано Brauser: стартовая страница защищённого режима.',
-    `user_pref("browser.startup.homepage", ${JSON.stringify(url)});`,
-    '',
-  ].join('\n'));
+  // В user.js меняется только наша строка: остальные настройки, которые там
+  // мог оставить пользователь (в том числе настройки защиты), сохраняются.
+  const file = path.join(profile, 'user.js');
+  const MARK = '// brauser: стартовая страница';
+  let kept = [];
+  try {
+    kept = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter((line) => line.trim()
+      && !line.includes(MARK)
+      && !line.startsWith('// Создано Brauser')
+      && !/^\s*user_pref\(\s*"browser\.startup\.homepage"\s*,/.test(line));
+  } catch { /* файла ещё нет */ }
+  fs.writeFileSync(file, [...kept, `user_pref("browser.startup.homepage", ${JSON.stringify(url)}); ${MARK}`, ''].join('\n'));
 }
 
 // Поиск из адресной строки: тот же DuckDuckGo, но с параметрами оформления и под

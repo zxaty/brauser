@@ -11,7 +11,12 @@ const { isBlocked } = require('./blocklist');
 const { searchUrl } = require('./search');
 
 const START_URL = pathToFileURL(path.join(__dirname, 'ui', 'start.html')).href;
+const BASIC_URL = pathToFileURL(path.join(__dirname, 'ui', 'basic.html')).href;
 const TOOLBAR_H = 84;
+// Ограничения на вкладки: страница не должна исчерпать память, открывая окна без конца.
+const MAX_TABS = 40;          // всего вкладок в окне
+const POPUP_LIMIT = 3;        // столько новых вкладок страница может открыть сама…
+const POPUP_WINDOW_MS = 5000; // …за этот промежуток времени
 
 let win = null;
 let ses = null;
@@ -106,7 +111,9 @@ function attachShortcuts(wc) {
   });
 }
 
+// Возвращает null, если достигнут предел числа вкладок.
 function createTab(url) {
+  if (tabs.size >= MAX_TABS) return null;
   const view = new WebContentsView({
     webPreferences: { session: getSession(), sandbox: true, contextIsolation: true, nodeIntegration: false },
   });
@@ -114,8 +121,16 @@ function createTab(url) {
   const tab = { id: nextTabId++, view };
   tabs.set(tab.id, tab);
 
+  // Новые окна по запросу страницы открываются вкладками, но не чаще POPUP_LIMIT
+  // раз за POPUP_WINDOW_MS с одной вкладки и не сверх общего предела.
+  let popups = [];
   wc.setWindowOpenHandler(({ url: target }) => {
-    if (/^https?:\/\//i.test(target)) createTab(target);
+    const now = Date.now();
+    popups = popups.filter((t) => now - t < POPUP_WINDOW_MS);
+    if (/^https?:\/\//i.test(target) && popups.length < POPUP_LIMIT) {
+      popups.push(now);
+      createTab(target);
+    }
     return { action: 'deny' };
   });
   wc.on('will-navigate', (event, target) => {
@@ -186,7 +201,14 @@ function open({ show = true } = {}) {
 }
 
 function registerIpc(ipcMain) {
-  const fromBasic = (fn) => (event, arg) => { if (win && event.sender === win.webContents) return fn(arg); };
+  // Команды принимаются только от главного кадра окна Basic с нашей страницей —
+  // не от вкладок с сайтами и не от вложенных кадров.
+  const fromBasic = (fn) => (event, arg) => {
+    const frame = event.senderFrame;
+    if (!win || win.isDestroyed() || event.sender !== win.webContents) return undefined;
+    if (!frame || frame !== win.webContents.mainFrame || frame.url !== BASIC_URL) return undefined;
+    return fn(arg);
+  };
   ipcMain.handle('basic:state', fromBasic(() => sendState()));
   ipcMain.handle('tab:new', fromBasic(() => { createTab(); }));
   ipcMain.handle('tab:close', fromBasic((id) => closeTab(id)));

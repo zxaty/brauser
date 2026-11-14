@@ -68,7 +68,7 @@ function youNode() {
   return {
     kind: 'you', iconName: 'you', role: 'Вы',
     main: real ? real.ip : 'ваш IP',
-    sub: real ? countryName(real.country) : (state.settings.checkIp ? '' : 'показ IP выключен'),
+    sub: real ? countryName(real.country) : (state.settings.showRealIp ? '' : 'показ IP выключен'),
   };
 }
 
@@ -183,7 +183,7 @@ function fillForm() {
   select.value = s.exitCountry;
   $('upstream').value = s.upstreamProxy;
   $('bridges').value = s.bridges;
-  $('checkip').checked = s.checkIp;
+  $('checkip').checked = s.showRealIp;
   $('autolaunch').checked = s.autoLaunch;
   formFilled = true;
 }
@@ -193,7 +193,7 @@ async function applySettings() {
     exitCountry: $('exit').value,
     upstreamProxy: $('upstream').value,
     bridges: $('bridges').value,
-    checkIp: $('checkip').checked,
+    showRealIp: $('checkip').checked,
     autoLaunch: $('autolaunch').checked,
   });
   formFilled = false;

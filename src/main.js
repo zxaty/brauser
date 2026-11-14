@@ -4,9 +4,10 @@
 // контролирует панель (src/tor.js). Здесь — окно панели, настройки и данные
 // для схемы маршрута.
 
-const { app, BrowserWindow, session, ipcMain, Menu } = require('electron');
+const { app, BrowserWindow, session, ipcMain, Menu, safeStorage } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
+const { pathToFileURL } = require('node:url');
 
 const { TorManager } = require('./tor');
 const { BrowserEngine } = require('./browser');
@@ -25,7 +26,10 @@ const DEFAULTS = {
   bridges: '',        // мосты, по одному в строке
   exitCountry: '',    // двухбуквенный код страны выхода, пусто — любая
   upstreamProxy: '',  // прокси перед Tor
-  checkIp: true,      // показывать свой IP на схеме (один прямой запрос к ipwho.is)
+  // Показывать свой настоящий IP на схеме. Для этого делается прямой запрос к
+  // ipwho.is МИМО Tor — сервис узнаёт реальный IP, поэтому по умолчанию выключено
+  // и включается только явно, галочкой в панели.
+  showRealIp: false,
   autoLaunch: true,   // открывать браузер, как только Tor подключился
 };
 
@@ -42,11 +46,25 @@ let recent = [];     // последние сайты и их выходные �
 
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
 
+// Есть ли настоящее хранилище секретов ОС (DPAPI в Windows, связка ключей в Linux).
+// Запасной вариант Linux «basic_text» шифрует общеизвестным ключом — его не считаем.
+function secretStoreAvailable() {
+  try {
+    if (!safeStorage.isEncryptionAvailable()) return false;
+    return process.platform !== 'linux' || safeStorage.getSelectedStorageBackend() !== 'basic_text';
+  } catch { return false; }
+}
+
 function loadSettings() {
   try {
     const saved = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
     settings = { ...DEFAULTS };
     for (const k of Object.keys(DEFAULTS)) if (typeof saved[k] === typeof DEFAULTS[k]) settings[k] = saved[k];
+    if (typeof saved.upstreamProxyEnc === 'string' && saved.upstreamProxyEnc) {
+      try { settings.upstreamProxy = safeStorage.decryptString(Buffer.from(saved.upstreamProxyEnc, 'base64')); } catch { settings.upstreamProxy = ''; }
+    }
+    // Сохранённый адрес прокси проходит ту же проверку, что и введённый в панели.
+    if (settings.upstreamProxy && !parseProxy(settings.upstreamProxy)) settings.upstreamProxy = '';
   } catch { settings = { ...DEFAULTS }; }
   if (!['secured', 'basic'].includes(settings.mode)) settings.mode = 'secured';
   if (SELFTEST) settings = { ...DEFAULTS, autoLaunch: false, bridges: process.env.BRAUSER_BRIDGES || '' };
@@ -54,7 +72,18 @@ function loadSettings() {
 
 function saveSettings() {
   if (SELFTEST) return;
-  try { fs.writeFileSync(settingsFile(), JSON.stringify(settings, null, 2)); } catch { /* не критично */ }
+  try {
+    const out = { ...settings };
+    // Адрес прокси может содержать пароль: при наличии хранилища секретов ОС он
+    // пишется на диск только в зашифрованном виде.
+    if (out.upstreamProxy && secretStoreAvailable()) {
+      out.upstreamProxyEnc = safeStorage.encryptString(out.upstreamProxy).toString('base64');
+      out.upstreamProxy = '';
+    }
+    const file = settingsFile();
+    fs.writeFileSync(file, JSON.stringify(out, null, 2), { mode: 0o600 });
+    fs.chmodSync(file, 0o600); // файл мог существовать с более широкими правами
+  } catch { /* не критично */ }
 }
 
 // ---------------------------------------------------------------- состояние для интерфейса
@@ -73,7 +102,7 @@ function sendState() {
       tor: { status: tor.status, progress: tor.progress, message: tor.message },
       browser: { running: engine.running, error: engine.error },
       route: {
-        real: settings.checkIp ? realIp : null,
+        real: settings.showRealIp ? realIp : null,
         upstream: up ? { scheme: up.scheme, host: up.host, port: up.port } : null,
         circuit,
       },
@@ -95,9 +124,10 @@ function startTor() {
 }
 
 // Настоящий IP нужен только чтобы показать начало маршрута. Запрос идёт
-// напрямую, мимо Tor, поэтому делается один раз и только если показ IP включён.
+// напрямую, мимо Tor, поэтому делается один раз и только если пользователь
+// сам включил показ IP.
 async function probeRealIp() {
-  if (!settings.checkIp || realIp) return;
+  if (!settings.showRealIp || realIp) return;
   try {
     const direct = session.fromPartition('direct-probe');
     await direct.setProxy({ mode: 'direct' });
@@ -129,7 +159,7 @@ function onStream(stream) {
 function launchBrowser(url) {
   if (engine.running) return notify('Браузер уже открыт');
   if (tor.status !== 'ready') return notify('Tor ещё не подключён — браузер откроется после подключения');
-  engine.launch(tor.cookieFile, url);
+  engine.launch(tor.connection, url);
 }
 
 // Tor и движок нужны только режиму Secured — в Basic ничего лишнего не запускается.
@@ -193,48 +223,60 @@ function createWindow() {
   win.on('closed', () => { win = null; app.quit(); });
 }
 
+const PANEL_URL = pathToFileURL(path.join(__dirname, 'ui', 'index.html')).href;
+
+// Команды панели принимаются только от главного кадра окна панели, в котором
+// открыта наша страница. Любой другой отправитель молча игнорируется.
+const fromPanel = (fn) => (event, arg) => {
+  const frame = event.senderFrame;
+  if (!win || win.isDestroyed() || event.sender !== win.webContents) return undefined;
+  if (!frame || frame !== win.webContents.mainFrame || frame.url !== PANEL_URL) return undefined;
+  return fn(arg);
+};
+
 function registerIpc() {
-  ipcMain.handle('state:get', () => { sendState(); });
-  ipcMain.handle('browser:launch', () => launchBrowser());
-  ipcMain.handle('basic:open', () => { basic.open(); });
-  ipcMain.handle('mode:set', (_e, mode) => {
+  ipcMain.handle('state:get', fromPanel(() => { sendState(); }));
+  ipcMain.handle('browser:launch', fromPanel(() => launchBrowser()));
+  ipcMain.handle('basic:open', fromPanel(() => { basic.open(); }));
+  ipcMain.handle('mode:set', fromPanel((mode) => {
     if (!['secured', 'basic'].includes(mode) || mode === settings.mode) return;
     settings.mode = mode;
     saveSettings();
     if (mode === 'secured') boot();
     else if (!engine.running) tor.stop(); // защищённый браузер закрыт — Tor больше не нужен
     sendState();
-  });
+  }));
   basic.registerIpc(ipcMain);
-  ipcMain.handle('tor:newnym', async () => {
+  ipcMain.handle('tor:newnym', fromPanel(async () => {
     try {
       await tor.newnym();
       circuit = null;
       notify('Готово: следующие соединения пойдут по новым цепочкам');
-    } catch (e) { notify(e.message); }
+    } catch (e) { notify('Цепочки не сменились: ' + e.message); }
     sendState();
-  });
-  ipcMain.handle('tor:restart', () => { tor.stop(); startTor(); });
+  }));
+  ipcMain.handle('tor:restart', fromPanel(() => { tor.stop(); startTor(); }));
 
-  ipcMain.handle('settings:set', (_e, patch) => {
+  ipcMain.handle('settings:set', fromPanel((patch) => {
+    if (!patch || typeof patch !== 'object') return;
     const next = { ...settings };
     if (typeof patch.bridges === 'string') next.bridges = patch.bridges.slice(0, 20000);
     if (typeof patch.exitCountry === 'string' && /^([a-z]{2})?$/i.test(patch.exitCountry)) next.exitCountry = patch.exitCountry.toLowerCase();
     if (typeof patch.upstreamProxy === 'string') {
       const value = patch.upstreamProxy.trim();
-      if (value && !parseProxy(value)) notify('Адрес прокси не распознан — оставлен прежний');
+      if (value && !parseProxy(value)) notify('Адрес прокси не распознан или содержит недопустимые символы — оставлен прежний');
       else next.upstreamProxy = value;
     }
-    for (const k of ['checkIp', 'autoLaunch']) if (typeof patch[k] === 'boolean') next[k] = patch[k];
+    for (const k of ['showRealIp', 'autoLaunch']) if (typeof patch[k] === 'boolean') next[k] = patch[k];
 
     const torChanged = ['bridges', 'exitCountry', 'upstreamProxy'].some((k) => next[k] !== settings[k]);
     settings = next;
     saveSettings();
-    if (!settings.checkIp) realIp = null;
+    if (!settings.showRealIp) realIp = null;
     else probeRealIp();
     if (torChanged && engine.installed) { tor.stop(); startTor(); }
     sendState();
-  });
+  }));
 }
 
 async function runSelfTest() {
@@ -246,9 +288,17 @@ async function runSelfTest() {
   await waitFor(() => tor.status === 'ready' || tor.status === 'error' || fatal, 180_000);
   result.tor = { status: tor.status, message: tor.message };
   if (tor.status === 'ready') {
+    // Control-порт: SAFECOOKIE работает, отказ Tor не принимается за успех,
+    // конфигурация с диска не читается.
+    result.transport = tor.ipc ? 'unix-сокеты' : 'tcp 127.0.0.1';
+    result.control = {
+      newnym: await tor.newnym().then(() => true, (e) => e.message),
+      badCommandRejected: await tor.control(['SIGNAL NOSUCHSIGNAL']).then(() => false, (e) => e.message),
+      torrcOnDisk: fs.existsSync(path.join(tor.dataDir, 'torrc')),
+    };
     const targets = [];
     tor.on('stream', (s) => targets.push(s.target));
-    engine.launch(tor.cookieFile, 'https://check.torproject.org/');
+    engine.launch(tor.connection, 'https://check.torproject.org/');
     // Движок должен выйти в сеть через НАШ Tor: ждём его соединение с проверочным сайтом.
     result.usedOurTor = await waitFor(() => targets.includes('check.torproject.org'), 120_000);
     result.browserRunning = engine.running;
@@ -294,7 +344,7 @@ if (!app.requestSingleInstanceLock()) {
       const ready = tor.status === 'ready';
       if (ready && !wasReady) {
         probeRealIp();
-        if ((settings.autoLaunch || OPEN_URL) && settings.mode === 'secured' && !engine.running) engine.launch(tor.cookieFile, OPEN_URL);
+        if ((settings.autoLaunch || OPEN_URL) && settings.mode === 'secured' && !engine.running) engine.launch(tor.connection, OPEN_URL);
       }
       wasReady = ready;
       sendState();
