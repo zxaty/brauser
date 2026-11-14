@@ -32,6 +32,7 @@ function render(state) {
   $('reload').textContent = active && active.loading ? '✕' : '⟳';
   const addr = $('addr');
   if (document.activeElement !== addr) addr.value = active ? active.url : '';
+  $('tosecured').disabled = !active || !active.url;
   $('chip').textContent = 'Basic · напрямую' + (state.blocked ? ` · заблокировано: ${state.blocked}` : '');
 }
 
@@ -45,6 +46,7 @@ $('addrform').addEventListener('submit', (e) => {
   $('addr').blur();
 });
 $('addr').addEventListener('focus', () => $('addr').select());
+$('tosecured').addEventListener('click', () => api.call('basic:to-secured'));
 
 api.onBasicState(render);
 api.onFocusAddress(() => { $('addr').focus(); });

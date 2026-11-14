@@ -23,11 +23,19 @@ let ses = null;
 let activeId = null;
 let nextTabId = 1;
 let blocked = 0;
+let openInSecured = null; // задаётся основным процессом: открыть адрес в защищённом браузере
 const tabs = new Map(); // id -> { id, view }
 
 function getSession() {
   if (ses) return ses;
   ses = session.fromPartition('persist:basic');
+  // Проверка орфографии выключена: словари для неё Chromium скачивает с серверов
+  // Google без спроса.
+  ses.setSpellCheckerEnabled(false);
+  ses.setSpellCheckerLanguages([]);
+  // Сеансу Basic прямой выход нужен по назначению — задаём его явно: по умолчанию
+  // сеть приложения направлена в никуда (см. main.js).
+  ses.setProxy({ mode: 'direct' });
   // Убираем из User-Agent упоминание Electron и названия приложения — так сайты
   // видят обычный Chrome и не ломаются.
   // Версию Chrome сокращаем до старшего номера, как это делает сам Chrome.
@@ -115,7 +123,7 @@ function attachShortcuts(wc) {
 function createTab(url) {
   if (tabs.size >= MAX_TABS) return null;
   const view = new WebContentsView({
-    webPreferences: { session: getSession(), sandbox: true, contextIsolation: true, nodeIntegration: false },
+    webPreferences: { session: getSession(), sandbox: true, contextIsolation: true, nodeIntegration: false, spellcheck: false },
   });
   const wc = view.webContents;
   const tab = { id: nextTabId++, view };
@@ -183,6 +191,7 @@ function open({ show = true } = {}) {
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      spellcheck: false,
     },
   });
   win.setMenuBarVisibility(false);
@@ -221,7 +230,13 @@ function registerIpc(ipcMain) {
   }));
   ipcMain.handle('nav:back', fromBasic(() => { const wc = activeWc(); if (wc && wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack(); }));
   ipcMain.handle('nav:forward', fromBasic(() => { const wc = activeWc(); if (wc && wc.navigationHistory.canGoForward()) wc.navigationHistory.goForward(); }));
+  // Текущая страница — в защищённый браузер. Адрес берётся у самой вкладки, а не из интерфейса.
+  ipcMain.handle('basic:to-secured', fromBasic(() => {
+    const wc = activeWc();
+    const url = wc ? wc.getURL() : '';
+    if (openInSecured && /^https?:\/\//i.test(url)) openInSecured(url);
+  }));
   ipcMain.handle('nav:reload', fromBasic(() => { const wc = activeWc(); if (wc) wc.isLoading() ? wc.stop() : wc.reload(); }));
 }
 
-module.exports = { open, registerIpc, tabs, isOpen: () => !!win };
+module.exports = { open, registerIpc, tabs, isOpen: () => !!win, setOpenInSecured: (fn) => { openInSecured = fn; } };

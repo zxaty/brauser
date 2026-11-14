@@ -11,6 +11,7 @@ const el = (tag, cls, text) => {
 
 let state = null;
 let formFilled = false;
+let selectedTarget = null; // сайт из списка соединений, чью цепочку показывает схема
 
 // ------------------------------------------------------------ схема маршрута
 
@@ -77,6 +78,10 @@ function renderSecuredRoute() {
   const nodes = [youNode()];
   let linkClass = 'secure';
   let note = '';
+  // Показываем цепочку сайта, выбранного в списке соединений, иначе — последнюю.
+  const picked = selectedTarget ? state.recent.find((r) => r.target === selectedTarget && r.hops) : null;
+  if (selectedTarget && !picked) selectedTarget = null;
+  const shownCircuit = picked ? { target: picked.target, hops: picked.hops } : route.circuit;
 
   if (route.upstream) {
     nodes.push({
@@ -98,9 +103,9 @@ function renderSecuredRoute() {
     nodes.push({ kind: 'site off', iconName: 'site', role: 'Сайт видит', main: '—', sub: 'трафик заблокирован' });
     linkClass = 'idle';
     note = 'Пока Tor не подключён, защищённый браузер не выпускает трафик наружу — напрямую он не пойдёт.';
-  } else if (route.circuit) {
+  } else if (shownCircuit) {
     const roles = ['Входной узел', 'Промежуточный узел', 'Выходной узел'];
-    const hops = route.circuit.hops.slice(-3);
+    const hops = shownCircuit.hops.slice(-3);
     hops.forEach((hop, i) => nodes.push({
       kind: 'tor', iconName: 'tor', role: roles[i + (3 - hops.length)],
       main: hop.ip || 'мост',
@@ -110,11 +115,11 @@ function renderSecuredRoute() {
     const exit = hops[hops.length - 1];
     nodes.push({
       kind: 'site', iconName: 'site', role: 'Сайт',
-      main: route.circuit.target,
+      main: shownCircuit.target,
       sub: 'видит ' + (exit.ip || 'выходной узел'),
       extra: countryName(exit.country),
     });
-    note = 'Цепочка последнего соединения. Входной узел знает ваш IP, но не знает, куда вы идёте. Выходной видит сайт, но не знает, кто вы.';
+    note = (picked ? 'Цепочка выбранного сайта.' : 'Цепочка последнего соединения.') + ' Входной узел знает ваш IP, но не знает, куда вы идёте. Выходной видит сайт, но не знает, кто вы.';
   } else {
     nodes.push({ kind: 'tor', iconName: 'tor', role: 'Сеть Tor', main: '3 узла', sub: 'подключено', extra: 'цепочка появится после первого сайта' });
     nodes.push({ kind: 'site', iconName: 'site', role: 'Сайт видит', main: 'выходной узел', sub: 'не ваш IP' });
@@ -125,7 +130,7 @@ function renderSecuredRoute() {
   $('routenote').textContent = note;
   $('transport').textContent = tor.transport === 'unix'
     ? 'Локальный доступ к Tor: Unix-сокеты, открытые только вашему пользователю.'
-    : 'Локальный доступ к Tor: TCP 127.0.0.1 (порты 9250 и 9251) — другие программы и пользователи этого компьютера тоже могут к нему подключиться.';
+    : `Локальный доступ к Tor: TCP 127.0.0.1 (порты ${tor.ports ? tor.ports.join(' и ') : '—'}, новые при каждом запуске) — другие программы и пользователи этого компьютера тоже могут к нему подключиться.`;
 }
 
 function renderBasicRoute() {
@@ -141,7 +146,17 @@ function renderRecent() {
   box.replaceChildren();
   $('recentcard').hidden = !state.recent.length;
   for (const r of state.recent) {
-    box.append(el('span', 'site', r.target), el('span', 'ip', r.ip || '—'), el('span', 'where', countryName(r.country)));
+    const site = el('button', 'site' + (r.target === selectedTarget ? ' picked' : ''), r.target);
+    site.title = 'Показать цепочку этого сайта на схеме';
+    site.addEventListener('click', () => {
+      selectedTarget = selectedTarget === r.target ? null : r.target;
+      renderSecuredRoute();
+      renderRecent();
+    });
+    const again = el('button', 'again', 'новая цепочка');
+    again.title = 'Закрыть цепочку этого сайта: следующее обращение к нему пойдёт по новой';
+    again.addEventListener('click', () => api.call('tor:newcircuit', r.target));
+    box.append(site, el('span', 'ip', r.ip || 'мост'), el('span', 'where', countryName(r.country)), again);
   }
 }
 
@@ -223,6 +238,14 @@ $('open-basic').addEventListener('click', () => api.call('basic:open'));
 $('newnym').addEventListener('click', () => api.call('tor:newnym'));
 $('restart').addEventListener('click', () => api.call('tor:restart'));
 $('apply').addEventListener('click', applySettings);
+for (const kind of ['obfs4', 'snowflake']) {
+  $('builtin-' + kind).addEventListener('click', async () => {
+    const lines = await api.call('bridges:builtin', kind);
+    if (!lines) return;
+    $('bridges').value = lines;
+    toast('Встроенные мосты подставлены — нажмите «Применить»');
+  });
+}
 $('block-set').addEventListener('click', async () => {
   await api.call('proxy:resolve', { action: 'set', value: $('blockproxy').value });
   formFilled = false;

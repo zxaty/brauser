@@ -117,8 +117,13 @@ body.panel { overflow: auto; }
 @keyframes flow { to { background-position: 12px 0; } }
 @media (prefers-reduced-motion: reduce) { .link { animation: none; } }
 
-.recent { display: grid; grid-template-columns: 1fr max-content max-content; gap: 6px 18px; }
-.recent .site { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
+.recent { display: grid; grid-template-columns: 1fr max-content max-content max-content; gap: 4px 18px; align-items: center; }
+.recent .site { height: 26px; min-width: 0; padding: 0 8px; margin-left: -8px; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent .site.picked { background: var(--raised); color: var(--tor); }
+.recent .again { height: 24px; padding: 0 8px; color: var(--dim); font-size: 12px; border-color: var(--line); }
+.bridgebuttons { display: flex; gap: 8px; margin-top: 6px; }
+.bridgebuttons button { height: 26px; padding: 0 10px; font-size: 12px; border-color: var(--line); }
+#tosecured { flex: none; padding: 0 12px; border-color: #7d4698; color: var(--tor); white-space: nowrap; }
 .recent .ip { font-family: Consolas, "DejaVu Sans Mono", monospace; color: var(--ok); }
 .recent .where { color: var(--dim); }
 .actions { display: flex; gap: 8px; margin-top: 14px; }

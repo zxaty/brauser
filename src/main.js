@@ -4,11 +4,12 @@
 // контролирует панель (src/tor.js). Здесь — окно панели, настройки и данные
 // для схемы маршрута.
 
-const { app, BrowserWindow, session, ipcMain, Menu, safeStorage } = require('electron');
+const { app, BrowserWindow, session, ipcMain, Menu, safeStorage, clipboard } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
 const crypto = require('node:crypto');
+const { unzipSync, strFromU8 } = require('fflate');
 
 const { TorManager } = require('./tor');
 const { BrowserEngine } = require('./browser');
@@ -23,6 +24,21 @@ const OPEN_URL = (process.argv.find((a) => /^--open=https?:\/\//i.test(a)) || ''
 const REPORT_SETTINGS = process.argv.includes('--report-settings');
 // BRAUSER_USER_DATA — другая папка данных (для проверок и переносной установки).
 if (process.env.BRAUSER_USER_DATA) app.setPath('userData', path.resolve(process.env.BRAUSER_USER_DATA));
+// Встроенный Chromium не должен сам ходить в сеть: без этого он при запуске
+// скачивает словарь проверки орфографии с серверов Google (в обход Tor и не
+// спрашивая), а также может обновлять свои компоненты и слать служебные запросы.
+app.commandLine.appendSwitch('disable-background-networking');
+app.commandLine.appendSwitch('disable-component-update');
+app.commandLine.appendSwitch('disable-domain-reliability');
+app.commandLine.appendSwitch('no-pings');
+// Главная страховка: всё, что Chromium делает в сети сам по себе (системный
+// контекст и сеанс панели), уходит на несуществующий локальный прокси, то есть
+// никуда. Прямой выход получают только те сеансы, которым он явно нужен и
+// которым мы его сами задаём: окно Basic и разовый запрос своего IP.
+if (!process.env.BRAUSER_NO_BLACKHOLE) {
+  app.commandLine.appendSwitch('proxy-server', 'socks5://127.0.0.1:1');
+  app.commandLine.appendSwitch('proxy-bypass-list', '<-loopback>');
+}
 const TRACE = process.env.BRAUSER_TRACE;
 const trace = (m) => { if (TRACE) fs.appendFileSync(TRACE, m + '\n'); };
 
@@ -214,7 +230,7 @@ function sendState() {
       fatal,
       blocked: !!settingsBlock,
       installing: engine.installing,
-      tor: { status: tor.status, progress: tor.progress, message: tor.message, transport: tor.transport },
+      tor: { status: tor.status, progress: tor.progress, message: tor.message, transport: tor.transport, ports: tor.transport === 'tcp' ? [tor.socksPort, tor.controlPort] : null },
       browser: { running: engine.running, error: engine.error },
       route: {
         real: settings.showRealIp ? realIp : null,
@@ -272,9 +288,50 @@ function onStream(stream) {
     if (!hops) return;
     circuit = { target, hops };
     const exit = hops[hops.length - 1];
-    recent = [{ target, ip: exit.ip, country: exit.country }, ...recent.filter((r) => r.target !== target)].slice(0, 8);
+    recent = [{ target, ip: exit.ip, country: exit.country, hops, circuitId }, ...recent.filter((r) => r.target !== target)].slice(0, 8);
     sendState();
   }, 300);
+}
+
+// Публичные мосты, которые несёт сам Tor Browser (те же, что в его настройках
+// «встроенные мосты»). Читаются из ресурсов установленного движка.
+let builtinBridgesCache = null;
+function builtinBridges(kind) {
+  if (!builtinBridgesCache) {
+    const name = 'chrome/toolkit/content/global/pt_config.json';
+    const files = unzipSync(fs.readFileSync(path.join(engine.paths.browserDir, 'omni.ja')), { filter: (f) => f.name === name });
+    const config = JSON.parse(strFromU8(files[name]));
+    builtinBridgesCache = config && config.bridges ? config.bridges : {};
+  }
+  const list = builtinBridgesCache[kind];
+  return Array.isArray(list) ? list.filter((l) => typeof l === 'string' && !/[\p{Cc}\p{Zl}\p{Zp}]/u.test(l)) : [];
+}
+
+// Адрес, который нужно открыть в защищённом браузере, как только Tor будет готов.
+let pendingOpen = OPEN_URL;
+
+// Отдаёт адрес движку. Если тот уже открыт, а принять адрес не может (Linux),
+// адрес кладётся в буфер обмена — вставить его в адресную строку остаётся пользователю.
+function sendToEngine(url) {
+  if (engine.open(tor.connection, url)) return;
+  clipboard.writeText(url);
+  notify('Защищённый браузер уже открыт. Адрес скопирован в буфер обмена — вставьте его в адресную строку.');
+}
+
+// Открывает адрес в защищённом браузере (из Basic или повторным запуском с --open=).
+function openInSecured(url) {
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url) || url.length > 4096) return;
+  if (settings.mode !== 'secured') {
+    settings.mode = 'secured';
+    if (!settingsBlock) saveSettings();
+  }
+  if (win && !win.isDestroyed()) { if (win.isMinimized()) win.restore(); win.show(); }
+  if (settingsBlock) { startTor(); return; } // покажет причину и ничего не откроет
+  if (tor.status === 'ready') { sendToEngine(url); sendState(); return; }
+  pendingOpen = url;
+  notify('Адрес откроется в защищённом браузере, как только подключится Tor');
+  boot();
+  sendState();
 }
 
 function launchBrowser(url) {
@@ -334,6 +391,7 @@ function createWindow() {
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      spellcheck: false,
     },
   });
   win.setMenuBarVisibility(false);
@@ -381,6 +439,25 @@ function registerIpc() {
     sendState();
   }));
   ipcMain.handle('tor:restart', fromPanel(() => { tor.stop(); startTor(); }));
+  // Новая цепочка только для одного сайта: закрываем его текущую цепочку,
+  // следующее соединение с ним Tor построит заново.
+  ipcMain.handle('tor:newcircuit', fromPanel(async (target) => {
+    const entry = recent.find((r) => r.target === target);
+    if (!entry || !/^\d+$/.test(String(entry.circuitId))) return;
+    try {
+      await tor.control([`CLOSECIRCUIT ${entry.circuitId}`]);
+      recent = recent.filter((r) => r !== entry);
+      if (circuit && circuit.target === target) circuit = null;
+      notify(`Цепочка для ${target} закрыта — при следующем обращении к сайту будет построена новая`);
+    } catch (e) { notify('Цепочка не закрыта: ' + e.message); }
+    sendState();
+  }));
+  // Встроенные мосты Tor Browser для подстановки в поле мостов.
+  ipcMain.handle('bridges:builtin', fromPanel((kind) => {
+    if (!['obfs4', 'snowflake', 'meek'].includes(kind)) return '';
+    if (!engine.installed) { notify('Движок ещё не установлен — встроенные мосты появятся после первого запуска Secured'); return ''; }
+    try { return builtinBridges(kind).join('\n'); } catch (e) { notify('Не удалось прочитать встроенные мосты: ' + e.message); return ''; }
+  }));
 
   ipcMain.handle('settings:set', fromPanel((patch) => {
     if (!patch || typeof patch !== 'object') return;
@@ -462,7 +539,7 @@ async function runSelfTest() {
   if (tor.status === 'ready') {
     // Control-порт: SAFECOOKIE работает, отказ Tor не принимается за успех,
     // конфигурация с диска не читается.
-    result.transport = tor.ipc ? 'unix-сокеты: ' + tor.ipc.dir : 'tcp 127.0.0.1';
+    result.transport = tor.ipc ? 'unix-сокеты: ' + tor.ipc.dir : `tcp 127.0.0.1:${tor.socksPort}/${tor.controlPort}`;
     result.control = {
       newnym: await tor.newnym().then(() => true, (e) => e.message),
       badCommandRejected: await tor.control(['SIGNAL NOSUCHSIGNAL']).then(() => false, (e) => e.message),
@@ -474,6 +551,19 @@ async function runSelfTest() {
     // Движок должен выйти в сеть через НАШ Tor: ждём его соединение с проверочным сайтом.
     result.usedOurTor = await waitFor(() => targets.includes('check.torproject.org'), 120_000);
     result.browserRunning = engine.running;
+    // Передача второго адреса уже открытому браузеру и закрытие цепочки одного сайта.
+    let site = 'check.torproject.org';
+    if (engine.canHandOff) {
+      site = 'example.org';
+      engine.open(tor.connection, 'https://example.org/');
+      result.handoff = await waitFor(() => targets.includes(site), 60_000);
+    } else {
+      result.handoff = 'на этой системе работающему браузеру адрес передаётся через буфер обмена';
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+    const entry = recent.find((r) => r.target === site);
+    result.siteCircuit = entry ? { hops: entry.hops.length, closed: await tor.control([`CLOSECIRCUIT ${entry.circuitId}`]).then(() => true, (e) => e.message) } : null;
+    result.builtinBridges = { obfs4: builtinBridges('obfs4').length, snowflake: builtinBridges('snowflake').length };
     await new Promise((r) => setTimeout(r, 1500));
     result.targets = [...new Set(targets)].slice(0, 12);
     result.circuit = circuit;
@@ -492,6 +582,12 @@ async function runSelfTest() {
     userAgent: await tab.view.webContents.executeJavaScript('navigator.userAgent'),
     ui: await bw.webContents.executeJavaScript("({ tabs: document.querySelectorAll('.tab').length, chip: document.getElementById('chip').textContent })"),
   };
+  // Обычный браузер должен выходить в сеть напрямую, несмотря на общую заглушку.
+  // Проверка по запросу: она делает прямое соединение, которое тест утечек счёл бы утечкой.
+  if (process.env.BRAUSER_SELFTEST_BASIC_NET) {
+    await tab.view.webContents.loadURL('https://example.org/').catch(() => {});
+    result.basic.directTitle = tab.view.webContents.getTitle();
+  }
   result.panel = await win.webContents.executeJavaScript("({ pill: document.getElementById('pill').textContent, nodes: [...document.querySelectorAll('#routeflow .node .role')].map((n) => n.textContent), recent: document.querySelectorAll('#recent .site').length })");
   console.log('SELFTEST ' + JSON.stringify(result, null, 2));
   app.quit();
@@ -500,9 +596,15 @@ async function runSelfTest() {
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => { if (win) { if (win.isMinimized()) win.restore(); win.focus(); } });
+  app.on('second-instance', (_event, argv) => {
+    if (win) { if (win.isMinimized()) win.restore(); win.focus(); }
+    // brauser --open=https://… при уже работающей панели открывает адрес в защищённом браузере.
+    const arg = (argv || []).find((a) => /^--open=https?:\/\//i.test(a));
+    if (arg && tor) openInSecured(arg.slice('--open='.length));
+  });
 
   app.whenReady().then(async () => {
+    session.defaultSession.setSpellCheckerEnabled(false); // иначе словарь качается с серверов Google
     loadSettings();
     const userData = app.getPath('userData');
     engine = new BrowserEngine({
@@ -510,6 +612,8 @@ if (!app.requestSingleInstanceLock()) {
       bundleDirs: [path.join(process.resourcesPath, 'tor-browser-bundle'), path.join(app.getAppPath(), 'vendor')],
     });
     tor = new TorManager({ dataDir: path.join(userData, 'tor-data') });
+    await tor.init();
+    basic.setOpenInSecured(openInSecured);
     if (!REPORT_SETTINGS) migrateOldSecrets(tor.dataDir); // отчёт о настройках ничего на диске не меняет
 
     let wasReady = false;
@@ -517,7 +621,12 @@ if (!app.requestSingleInstanceLock()) {
       const ready = tor.status === 'ready';
       if (ready && !wasReady) {
         probeRealIp();
-        if ((settings.autoLaunch || OPEN_URL) && settings.mode === 'secured' && !engine.running) engine.launch(tor.connection, OPEN_URL);
+        if (settings.mode === 'secured') {
+          const url = pendingOpen;
+          pendingOpen = undefined;
+          if (url) sendToEngine(url);
+          else if (settings.autoLaunch && !engine.running) engine.launch(tor.connection);
+        }
       }
       wasReady = ready;
       sendState();

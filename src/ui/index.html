@@ -37,7 +37,7 @@
       <div class="hero">
         <button id="open-secured" class="big tor">Открыть защищённый браузер</button>
         <button id="newnym" class="wide" title="Построить новые цепочки: следующие соединения пойдут с других IP">Новая цепочка</button>
-        <p>Страницы открывает движок Tor Browser без изменений: у вас тот же отпечаток, что у миллионов его пользователей, и своя цепочка на каждый сайт.</p>
+        <p>Страницы открывает движок Tor Browser: у вас тот же отпечаток, что у миллионов его пользователей, и своя цепочка на каждый сайт.</p>
       </div>
 
       <div class="card">
@@ -50,7 +50,7 @@
       <div class="card" id="recentcard" hidden>
         <h3>Последние соединения</h3>
         <div id="recent" class="recent"></div>
-        <p class="hint">У каждого сайта своя цепочка и свой выходной IP. Список хранится только в памяти.</p>
+        <p class="hint">У каждого сайта своя цепочка и свой выходной IP. Нажмите на сайт, чтобы увидеть его цепочку на схеме. Список хранится только в памяти.</p>
       </div>
 
       <div class="card">
@@ -69,6 +69,10 @@
           <div>
             <label>Мосты <small>по одному в строке; нужны, если Tor заблокирован провайдером (bridges.torproject.org)</small>
               <textarea id="bridges" rows="6" spellcheck="false" placeholder="obfs4 1.2.3.4:443 FINGERPRINT cert=… iat-mode=0"></textarea>
+              <span class="bridgebuttons">
+                <button id="builtin-obfs4" type="button" title="Публичные мосты obfs4, встроенные в Tor Browser">Встроенные obfs4</button>
+                <button id="builtin-snowflake" type="button" title="Snowflake: соединение через браузеры добровольцев; медленнее, но труднее заблокировать">Встроенные snowflake</button>
+              </span>
             </label>
           </div>
         </div>

@@ -134,10 +134,16 @@ class BrowserEngine extends EventEmitter {
       env.TOR_CONTROL_PORT = String(connection.controlPort);
     }
     const args = [];
-    if (WIN) args.push('-wait-for-browser'); // иначе процесс-загрузчик сразу завершится
+    if (WIN) {
+      // --allow-remote: разрешить этому экземпляру принимать адреса от повторного
+      // запуска (так работает «Открыть в Secured»); без него Tor Browser их отвергает.
+      args.push('--allow-remote');
+      args.push('-wait-for-browser'); // иначе процесс-загрузчик сразу завершится
+    }
     if (url) args.push(url);
     const proc = spawn(this.paths.exe, args, { env, cwd: this.paths.browserDir, detached: !WIN, stdio: 'ignore' });
     this.proc = proc;
+    this.launchEnv = env;
     proc.on('error', (e) => {
       if (this.proc === proc) this.proc = null;
       this.error = 'Не удалось запустить браузер: ' + e.message;
@@ -154,6 +160,23 @@ class BrowserEngine extends EventEmitter {
       this._followRestart(proc, { quickExit: afterMs < 20_000 });
     });
     this.emit('change');
+  }
+
+  // Можно ли передать адрес уже работающему движку. На Windows — да: второй вызов
+  // исполняемого файла отдаёт адрес работающему экземпляру. На Linux Tor Browser
+  // отключает D-Bus, через который Firefox принимает такие команды, — нельзя.
+  get canHandOff() { return WIN; }
+
+  // Открывает адрес в защищённом браузере: запускает движок или открывает новую
+  // вкладку в уже работающем. Возвращает false, если движок работает, а передать
+  // ему адрес на этой системе нельзя.
+  open(connection, url) {
+    if (!this.proc) { this.launch(connection, url); return true; }
+    if (!this.canHandOff) return false;
+    try {
+      spawn(this.paths.exe, ['--allow-remote', url], { env: this.launchEnv, cwd: this.paths.browserDir, detached: true, stdio: 'ignore' }).unref();
+      return true;
+    } catch { return false; }
   }
 
   // Работает ли сейчас хоть один процесс движка, запущенный из нашей установки.

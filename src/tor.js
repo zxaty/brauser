@@ -84,6 +84,8 @@ class TorManager extends EventEmitter {
     this.progress = 0;
     this.message = '';
     this.lastNewnym = 0;
+    this.socksPort = SOCKS_PORT;     // при TCP-доступе заменяются свободными случайными портами в init()
+    this.controlPort = CONTROL_PORT;
     this.socketDir = null;       // каталог Unix-сокетов (выбирается один раз за запуск приложения)
     this.ownsSocketDir = false;  // каталог создан нами во временной папке — убрать при выходе
     this.events = null;          // постоянное соединение с control-портом для событий
@@ -91,6 +93,26 @@ class TorManager extends EventEmitter {
   }
 
   get cookieFile() { return path.join(this.dataDir, 'control_auth_cookie'); }
+
+  // При TCP-доступе (Windows) выбирает два свободных случайных порта на этот
+  // запуск приложения вместо постоянных 9250 и 9251: они не конфликтуют с другой
+  // программой и не известны заранее. Это не защита от программы, которая
+  // перебирает порты, — на Windows локальный доступ к Tor остаётся открытым.
+  async init() {
+    if (this.transport !== 'tcp') return;
+    const freePort = () => new Promise((resolve, reject) => {
+      const server = net.createServer();
+      server.unref();
+      server.on('error', reject);
+      server.listen(0, '127.0.0.1', () => { const { port } = server.address(); server.close(() => resolve(port)); });
+    });
+    try {
+      const socks = await freePort();
+      let control = await freePort();
+      for (let i = 0; i < 5 && control === socks; i++) control = await freePort();
+      if (control !== socks) { this.socksPort = socks; this.controlPort = control; }
+    } catch { /* остаёмся на портах по умолчанию */ }
+  }
 
   // Как Tor доступен локально. Linux и macOS — Unix-сокеты в каталоге только для
   // владельца: другой пользователь той же машины подключиться не может. Windows —
@@ -167,7 +189,7 @@ class TorManager extends EventEmitter {
     const ipc = this.ipc;
     return ipc
       ? { cookieFile: this.cookieFile, socksPath: ipc.socks, controlPath: ipc.control }
-      : { cookieFile: this.cookieFile, socksPort: SOCKS_PORT, controlPort: CONTROL_PORT };
+      : { cookieFile: this.cookieFile, socksPort: this.socksPort, controlPort: this.controlPort };
   }
 
   _set(status, message = '', progress = this.progress) {
@@ -182,8 +204,8 @@ class TorManager extends EventEmitter {
   _buildConfig(paths, { bridges, exitCountry, upstreamProxy } = {}) {
     const ipc = this.ipc;
     const lines = [
-      ipc ? `SocksPort unix:${ipc.socks}` : `SocksPort 127.0.0.1:${SOCKS_PORT}`,
-      ipc ? `ControlPort unix:${ipc.control}` : `ControlPort 127.0.0.1:${CONTROL_PORT}`,
+      ipc ? `SocksPort unix:${ipc.socks}` : `SocksPort 127.0.0.1:${this.socksPort}`,
+      ipc ? `ControlPort unix:${ipc.control}` : `ControlPort 127.0.0.1:${this.controlPort}`,
       'CookieAuthentication 1',
       `CookieAuthFile ${quotePath(this.cookieFile)}`,
       `DataDirectory ${quotePath(this.dataDir)}`,
@@ -338,7 +360,7 @@ class TorManager extends EventEmitter {
       if (cookie.length !== 32) { reject(new Error('файл cookie Tor повреждён')); return; }
 
       const ipc = this.ipc;
-      const sock = ipc ? net.connect({ path: ipc.control }) : net.connect(CONTROL_PORT, '127.0.0.1');
+      const sock = ipc ? net.connect({ path: ipc.control }) : net.connect(this.controlPort, '127.0.0.1');
       const pending = [];
       let closed = false;
       let established = false;
