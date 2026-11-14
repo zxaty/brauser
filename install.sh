@@ -11,8 +11,8 @@
 set -eu
 
 repo="zxaty/brauser"
-version="1.2.0"
-sha256="27d8416bb90473a151697646e0e80628ef5d1592dfe449a8b7f36824997f5375"
+version="1.3.0"
+sha256="0050439eaa748b504be20f68365737a30dd2b99fea0ac99b19e799239b9e4d49"
 
 if [ "$(uname -m)" != "x86_64" ]; then
   echo "Brauser собран только для 64-битных процессоров x86 (у вас $(uname -m))." >&2
