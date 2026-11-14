@@ -51,20 +51,17 @@ class BrowserEngine extends EventEmitter {
     return null;
   }
 
-  // Сверяет SHA-256 архива с закреплённым. Подменённый или повреждённый архив
-  // не будет ни запущен, ни распакован.
-  _verifyBundle({ file, sha256 }) {
-    return new Promise((resolve, reject) => {
-      const hash = crypto.createHash('sha256');
-      fs.createReadStream(file)
-        .on('data', (chunk) => hash.update(chunk))
-        .on('error', reject)
-        .on('end', () => {
-          const actual = hash.digest('hex');
-          if (actual === sha256) resolve();
-          else reject(new Error(`архив Tor Browser не прошёл проверку подлинности (SHA-256 ${actual.slice(0, 16)}… не совпадает с закреплённым)`));
-        });
-    });
+  // Читает архив в память и сверяет SHA-256 с закреплённым. Дальше используются
+  // именно эти проверенные байты, а не файл по тому же пути: подменить архив
+  // между проверкой и запуском нельзя. Подменённый или повреждённый архив не
+  // будет ни запущен, ни распакован.
+  async _readVerifiedBundle({ file, sha256 }) {
+    const data = await fs.promises.readFile(file);
+    const actual = crypto.createHash('sha256').update(data).digest('hex');
+    if (actual !== sha256) {
+      throw new Error(`архив Tor Browser не прошёл проверку подлинности (SHA-256 ${actual.slice(0, 16)}… не совпадает с закреплённым)`);
+    }
+    return data;
   }
 
   // Первая установка: распаковка архива Tor Browser из поставки.
@@ -72,25 +69,34 @@ class BrowserEngine extends EventEmitter {
     if (this.installed) return;
     const found = this._findBundle();
     if (!found) throw new Error('В поставке нет архива Tor Browser');
-    const bundle = found.file;
     this.installing = true;
     this.emit('change');
+    // Windows: проверенные байты установщика кладутся в папку данных пользователя
+    // и запускаются оттуда — файл из поставки после проверки больше не читается.
+    const setup = path.join(path.dirname(this.root), `tor-browser-setup-${process.pid}.exe`);
     try {
-      await this._verifyBundle(found);
+      const data = await this._readVerifiedBundle(found);
       fs.rmSync(this.root, { recursive: true, force: true });
       fs.mkdirSync(this.root, { recursive: true });
-      // Windows: «портативный» установщик Tor Browser, тихий режим, папка через /D=
-      // (по правилам NSIS этот ключ идёт последним и без кавычек).
-      const [cmd, args, opts] = WIN
-        ? [bundle, ['/S', `/D=${this.root}`], { windowsVerbatimArguments: true }]
-        : ['tar', ['-xJf', bundle, '-C', this.root, '--strip-components=1'], {}];
       await new Promise((resolve, reject) => {
-        const p = spawn(cmd, args, { windowsHide: true, stdio: 'ignore', ...opts });
+        let p;
+        if (WIN) {
+          fs.writeFileSync(setup, data, { mode: 0o700 });
+          // «Портативный» установщик Tor Browser: тихий режим, папка через /D=
+          // (по правилам NSIS этот ключ идёт последним и без кавычек).
+          p = spawn(setup, ['/S', `/D=${this.root}`], { windowsHide: true, stdio: 'ignore', windowsVerbatimArguments: true });
+        } else {
+          // Linux: проверенные байты подаются распаковщику на вход.
+          p = spawn('tar', ['-xJf', '-', '-C', this.root, '--strip-components=1'], { stdio: ['pipe', 'ignore', 'ignore'] });
+          p.stdin.on('error', reject);
+          p.stdin.end(data);
+        }
         p.on('error', reject);
         p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`распаковка завершилась с кодом ${code}`))));
       });
       if (!this.installed) throw new Error('после распаковки не найден Tor Browser в ' + this.root);
     } finally {
+      try { fs.rmSync(setup, { force: true }); } catch { /* не критично */ }
       this.installing = false;
       this.emit('change');
     }
