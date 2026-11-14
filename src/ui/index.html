@@ -19,6 +19,19 @@
 
     <div id="fatal" class="fatal" hidden></div>
 
+    <!-- Показывается, когда сохранённый прокси перед Tor потерян: нужно явное решение -->
+    <div id="blockcard" class="card block" hidden>
+      <h2>Прокси перед Tor: нужно ваше решение</h2>
+      <p class="hint">Раньше здесь был настроен прокси, скрывающий Tor от провайдера, но восстановить его не удалось. Пока вы не выберете одно из двух, Tor запускаться не будет.</p>
+      <label>Адрес прокси <small>socks5://host:port или http://user:pass@host:port</small>
+        <input id="blockproxy" type="text" spellcheck="false" autocomplete="off">
+      </label>
+      <div class="actions">
+        <button id="block-set" class="wide accent">Сохранить прокси и запустить</button>
+        <button id="block-none" class="wide">Продолжить без прокси…</button>
+      </div>
+    </div>
+
     <!-- ================= Secured ================= -->
     <div id="view-secured">
       <div class="hero">

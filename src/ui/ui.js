@@ -156,6 +156,9 @@ function renderTop() {
   $('view-basic').hidden = secured;
   $('fatal').hidden = !fatal;
   $('fatal').textContent = fatal;
+  $('blockcard').hidden = !state.blocked;
+  $('apply').disabled = state.blocked; // обычные настройки не применяются, пока не решён вопрос с прокси
+  $('restart').disabled = state.blocked;
 
   const pill = $('pill');
   let text = 'Basic · прямое соединение';
@@ -220,6 +223,16 @@ $('open-basic').addEventListener('click', () => api.call('basic:open'));
 $('newnym').addEventListener('click', () => api.call('tor:newnym'));
 $('restart').addEventListener('click', () => api.call('tor:restart'));
 $('apply').addEventListener('click', applySettings);
+$('block-set').addEventListener('click', async () => {
+  await api.call('proxy:resolve', { action: 'set', value: $('blockproxy').value });
+  formFilled = false;
+});
+$('block-none').addEventListener('click', async () => {
+  // Отдельное подтверждение: это решение открывает провайдеру сам факт использования Tor.
+  if (!window.confirm('Продолжить без прокси?\n\nTor будет подключаться напрямую, и провайдер увидит, что вы используете Tor.')) return;
+  await api.call('proxy:resolve', { action: 'none' });
+  formFilled = false;
+});
 
 api.onState((next) => {
   state = next;
