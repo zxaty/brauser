@@ -1,7 +1,7 @@
 {
   "name": "brauser",
   "productName": "Brauser",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Brauser: панель управления и движок Tor Browser (Secured) плюс обычный быстрый браузер (Basic)",
   "author": {
     "name": "Brauser",
