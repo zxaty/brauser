@@ -84,6 +84,8 @@ class TorManager extends EventEmitter {
     this.progress = 0;
     this.message = '';
     this.lastNewnym = 0;
+    this.socketDir = null;       // каталог Unix-сокетов (выбирается один раз за запуск приложения)
+    this.ownsSocketDir = false;  // каталог создан нами во временной папке — убрать при выходе
     this.events = null;          // постоянное соединение с control-портом для событий
     this.relayCache = new Map(); // отпечаток узла -> { ip, country }
   }
@@ -100,24 +102,46 @@ class TorManager extends EventEmitter {
   }
 
   // Сокеты лежат не в папке данных (её путь может быть длинным или с пробелами),
-  // а в коротком отдельном каталоге: $XDG_RUNTIME_DIR или системный временный.
+  // а в коротком отдельном каталоге. Каталог выбирается один раз за запуск
+  // приложения: уже открытый браузер помнит его путь, и после перезапуска Tor
+  // сокеты должны появиться там же. Бросает ошибку, если каталог недоступен.
   get ipc() {
     if (this.transport !== 'unix') return null;
-    const runtime = process.env.XDG_RUNTIME_DIR;
-    const base = runtime && path.isAbsolute(runtime) && fs.existsSync(runtime) ? runtime : os.tmpdir();
-    const dir = path.join(base, `brauser-tor-${process.getuid()}`);
+    if (!this.socketDir) this._prepareSocketDir();
+    const dir = this.socketDir;
     return { dir, socks: path.join(dir, 'socks.sock'), control: path.join(dir, 'control.sock') };
   }
 
-  // Создаёт каталог сокетов и убеждается, что он наш и закрыт для остальных.
-  // Бросает ошибку, если это не так, — запускать Tor на таком каталоге нельзя.
+  // Создаёт (или перепроверяет) каталог сокетов и убеждается, что он наш и
+  // закрыт для остальных. Бросает ошибку, если это не так.
   _prepareSocketDir() {
-    const { dir, socks, control } = this.ipc;
-    // Путь сокета ограничен ~107 байтами; спецсимволы потребовали бы особого синтаксиса torrc.
-    if (!/^[A-Za-z0-9._/+-]+$/.test(dir) || Buffer.byteLength(control) > 100) {
-      throw new Error('путь для сокетов Tor не подходит: ' + dir);
+    if (!this.socketDir) {
+      // Личный каталог сеанса, если система его даёт: в нём чужих имён быть не может.
+      const runtime = process.env.XDG_RUNTIME_DIR;
+      let ownRuntime = false;
+      try {
+        const st = runtime && path.isAbsolute(runtime) ? fs.statSync(runtime) : null;
+        ownRuntime = !!st && st.isDirectory() && st.uid === process.getuid() && (st.mode & 0o077) === 0;
+      } catch { /* каталога нет */ }
+      let dir;
+      if (ownRuntime) {
+        dir = path.join(runtime, 'brauser-tor');
+        try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+      } else {
+        // Запасной вариант — каталог со случайным именем в общем временном:
+        // его нельзя занять заранее, и создаётся он сразу с правами 0700.
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brauser-tor-'));
+        this.ownsSocketDir = true;
+      }
+      // Путь сокета ограничен ~107 байтами; спецсимволы потребовали бы особого синтаксиса torrc.
+      if (!/^[A-Za-z0-9._/+-]+$/.test(dir) || Buffer.byteLength(path.join(dir, 'control.sock')) > 100) {
+        if (this.ownsSocketDir) fs.rmSync(dir, { recursive: true, force: true });
+        this.ownsSocketDir = false;
+        throw new Error('путь для сокетов Tor не подходит: ' + dir);
+      }
+      this.socketDir = dir;
     }
-    try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    const dir = this.socketDir;
     let st = fs.lstatSync(dir); // lstat: символическая ссылка вместо каталога не пройдёт
     if (st.isDirectory() && st.uid === process.getuid() && (st.mode & 0o077) !== 0) {
       fs.chmodSync(dir, 0o700);
@@ -126,7 +150,16 @@ class TorManager extends EventEmitter {
     if (!st.isDirectory() || st.uid !== process.getuid() || (st.mode & 0o077) !== 0) {
       throw new Error('каталог сокетов Tor занят другим пользователем или открыт посторонним: ' + dir);
     }
-    for (const stale of [socks, control]) fs.rmSync(stale, { force: true });
+    for (const stale of ['socks.sock', 'control.sock']) fs.rmSync(path.join(dir, stale), { force: true });
+  }
+
+  // Убирает за собой каталог сокетов, созданный во временной папке. Вызывается при выходе.
+  dispose() {
+    if (this.ownsSocketDir && this.socketDir) {
+      try { fs.rmSync(this.socketDir, { recursive: true, force: true }); } catch { /* не критично */ }
+    }
+    this.socketDir = null;
+    this.ownsSocketDir = false;
   }
 
   // Как движку и панели подключаться к этому Tor.
@@ -168,7 +201,11 @@ class TorManager extends EventEmitter {
       // рабочая папка процесса, см. start): в нём нет ни пробелов, ни спецсимволов.
       if (fs.existsSync(paths.lyrebird)) {
         const rel = path.relative(path.dirname(paths.tor), paths.lyrebird).split(path.sep).join('/');
-        if (/^[A-Za-z0-9._/-]+$/.test(rel) && !rel.startsWith('..')) lines.push(`ClientTransportPlugin meek_lite,obfs4,scramblesuit,webtunnel exec ./${rel}`);
+        if (/^[A-Za-z0-9._/-]+$/.test(rel) && !rel.startsWith('..')) {
+          // Те же две строки, что задаёт сам Tor Browser: обычные транспорты и snowflake.
+          lines.push(`ClientTransportPlugin meek_lite,obfs2,obfs3,obfs4,scramblesuit,webtunnel exec ./${rel}`);
+          lines.push(`ClientTransportPlugin snowflake exec ./${rel}`);
+        }
       }
       for (const b of bridgeLines) lines.push(`Bridge ${b}`);
     }
@@ -213,6 +250,8 @@ class TorManager extends EventEmitter {
     }
     let config;
     try {
+      // Сокеты недоступны — Tor не запускается. Молчаливого отката на TCP нет.
+      if (this.transport === 'unix') this._prepareSocketDir();
       config = this._buildConfig(paths, options);
     } catch (e) {
       this._set('error', 'Tor не запущен: ' + e.message, 0);
@@ -225,15 +264,6 @@ class TorManager extends EventEmitter {
     try { fs.rmSync(this.cookieFile, { force: true }); } catch { /* не критично */ }
     // Прежние версии писали конфигурацию (с паролем прокси) в файл — убираем его.
     try { fs.rmSync(path.join(this.dataDir, 'torrc'), { force: true }); } catch { /* не критично */ }
-    if (this.ipc) {
-      try {
-        this._prepareSocketDir();
-      } catch (e) {
-        // Сокеты недоступны — Tor не запускается. Молчаливого отката на TCP нет.
-        this._set('error', 'Tor не запущен: ' + e.message, 0);
-        return;
-      }
-    }
 
     this._dropEvents(); // соединение с прежним процессом Tor, если он упал сам
     this._set('starting', 'Запуск Tor…', 0);

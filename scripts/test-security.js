@@ -116,7 +116,7 @@ check('транспорт мостов задаётся относительны
   fs.mkdirSync(path.join(torDir, 'PluggableTransports'), { recursive: true });
   fs.writeFileSync(path.join(torDir, 'PluggableTransports', exe), '');
   const config = tor._buildConfig({ tor: path.join(torDir, 'tor'), lyrebird: path.join(torDir, 'PluggableTransports', exe), geoipDir: dataDir }, { bridges: 'obfs4 192.0.2.1:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=abc iat-mode=0' });
-  assert.ok(config.includes(`ClientTransportPlugin meek_lite,obfs4,scramblesuit,webtunnel exec ./PluggableTransports/${exe}\n`), config);
+  assert.ok(config.includes(`ClientTransportPlugin meek_lite,obfs2,obfs3,obfs4,scramblesuit,webtunnel exec ./PluggableTransports/${exe}\n`), config);
   if (torBin) assert.strictEqual(verify(config).status, 0, verify(config).stdout);
 });
 
@@ -154,6 +154,11 @@ if (!WIN) {
     const t = new TorManager({ dataDir: path.join(dataDir, 'с пробелом и юникодом') });
     assert.strictEqual(t.transport, 'unix');
     t._prepareSocketDir();
+    const other = new TorManager({ dataDir });
+    other._prepareSocketDir();
+    // Без личного каталога сеанса имя случайное: два менеджера не делят один каталог.
+    if (!process.env.XDG_RUNTIME_DIR) assert.notStrictEqual(other.socketDir, t.socketDir);
+    other.dispose();
     const st = fs.lstatSync(t.ipc.dir);
     assert.ok(st.isDirectory() && st.uid === process.getuid() && (st.mode & 0o077) === 0, t.ipc.dir);
     assert.ok(/^[A-Za-z0-9._/+-]+$/.test(t.ipc.dir) && Buffer.byteLength(t.ipc.control) <= 100, t.ipc.dir);
@@ -161,10 +166,11 @@ if (!WIN) {
     fs.chmodSync(t.ipc.dir, 0o777);
     t._prepareSocketDir();
     assert.strictEqual(fs.lstatSync(t.ipc.dir).mode & 0o077, 0);
-    fs.rmSync(t.ipc.dir, { recursive: true, force: true });
-    fs.symlinkSync(dataDir, t.ipc.dir);
+    const dir = t.socketDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.symlinkSync(dataDir, dir);
     assert.throws(() => t._prepareSocketDir(), /каталог сокетов/);
-    fs.rmSync(t.ipc.dir, { force: true });
+    fs.rmSync(t.socketDir, { force: true });
   });
 }
 
