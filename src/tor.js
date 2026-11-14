@@ -7,6 +7,7 @@ const { EventEmitter } = require('node:events');
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const net = require('node:net');
+const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
 const { parseProxy } = require('./proxy');
@@ -18,23 +19,34 @@ const CONTROL_PORT = 9251;
 const SERVER_TO_CONTROLLER = 'Tor safe cookie authentication server-to-controller hash';
 const CONTROLLER_TO_SERVER = 'Tor safe cookie authentication controller-to-server hash';
 
-const fwd = (p) => p.replace(/\\/g, '/');
+const WIN = process.platform === 'win32';
+const MAX_REPLY_CHARS = 4 * 1024 * 1024;
+
 // Значение директивы в кавычках, с экранированием по правилам torrc.
 const quote = (s) => '"' + String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+// Путь для конфигурации: всегда в кавычках и с экранированием, без какой-либо
+// замены символов — Tor получает ровно тот путь, который есть на диске.
+const quotePath = (p) => quote(p);
 const hasControlChars = (s) => /[\p{Cc}\p{Zl}\p{Zp}]/u.test(s);
 
 // Разбирает поток control-порта на отдельные ответы. Ответ заканчивается
 // строкой «NNN текст»; «NNN-текст» — промежуточная строка; «NNN+текст»
 // открывает блок данных, который длится до строки из одной точки.
 class ReplyReader {
-  constructor(onReply) {
+  constructor(onReply, onOverflow) {
     this.onReply = onReply;
+    this.onOverflow = onOverflow;
     this.buf = '';
     this.lines = [];
     this.inData = false;
+    this.size = 0; // символов в ещё не завершённом ответе
   }
 
   push(chunk) {
+    // Настоящие ответы Tor на наши команды — килобайты. Предел не даёт
+    // подставному собеседнику занять память бесконечным ответом.
+    this.size += chunk.length;
+    if (this.size > MAX_REPLY_CHARS) { this.buf = ''; this.lines = []; this.onOverflow(); return; }
     this.buf += chunk;
     let i;
     while ((i = this.buf.indexOf('\n')) !== -1) {
@@ -57,6 +69,7 @@ class ReplyReader {
     if (m[2] === ' ') {
       const reply = { code: m[1], lines: this.lines };
       this.lines = [];
+      this.size = this.buf.length;
       this.onReply(reply);
     }
   }
@@ -77,17 +90,43 @@ class TorManager extends EventEmitter {
 
   get cookieFile() { return path.join(this.dataDir, 'control_auth_cookie'); }
 
-  // Linux и macOS: SOCKS и control работают через Unix-сокеты в папке данных Tor,
-  // доступной только владельцу, — другой пользователь той же машины подключиться
-  // к ним не может. На Windows (и если путь не годится для сокета) остаётся TCP
-  // на 127.0.0.1, который пользователей ОС не различает.
+  // Как Tor доступен локально. Linux и macOS — Unix-сокеты в каталоге только для
+  // владельца: другой пользователь той же машины подключиться не может. Windows —
+  // TCP на 127.0.0.1, который пользователей ОС не различает. Перейти на TCP в
+  // Linux/macOS можно только явно, переменной BRAUSER_TOR_TCP=1: если сокеты
+  // создать нельзя, Tor не запускается, а не откатывается на TCP молча.
+  get transport() {
+    return WIN || process.env.BRAUSER_TOR_TCP === '1' ? 'tcp' : 'unix';
+  }
+
+  // Сокеты лежат не в папке данных (её путь может быть длинным или с пробелами),
+  // а в коротком отдельном каталоге: $XDG_RUNTIME_DIR или системный временный.
   get ipc() {
-    if (process.platform === 'win32' || process.env.BRAUSER_TOR_TCP) return null;
-    const socks = path.join(this.dataDir, 'socks.sock');
-    const control = path.join(this.dataDir, 'control.sock');
-    // Путь сокета ограничен ~107 байтами; пробелы и кавычки потребовали бы особого синтаксиса torrc.
-    if (Buffer.byteLength(control) > 100 || /[\s"'\\#]/.test(this.dataDir)) return null;
-    return { socks, control };
+    if (this.transport !== 'unix') return null;
+    const runtime = process.env.XDG_RUNTIME_DIR;
+    const base = runtime && path.isAbsolute(runtime) && fs.existsSync(runtime) ? runtime : os.tmpdir();
+    const dir = path.join(base, `brauser-tor-${process.getuid()}`);
+    return { dir, socks: path.join(dir, 'socks.sock'), control: path.join(dir, 'control.sock') };
+  }
+
+  // Создаёт каталог сокетов и убеждается, что он наш и закрыт для остальных.
+  // Бросает ошибку, если это не так, — запускать Tor на таком каталоге нельзя.
+  _prepareSocketDir() {
+    const { dir, socks, control } = this.ipc;
+    // Путь сокета ограничен ~107 байтами; спецсимволы потребовали бы особого синтаксиса torrc.
+    if (!/^[A-Za-z0-9._/+-]+$/.test(dir) || Buffer.byteLength(control) > 100) {
+      throw new Error('путь для сокетов Tor не подходит: ' + dir);
+    }
+    try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    let st = fs.lstatSync(dir); // lstat: символическая ссылка вместо каталога не пройдёт
+    if (st.isDirectory() && st.uid === process.getuid() && (st.mode & 0o077) !== 0) {
+      fs.chmodSync(dir, 0o700);
+      st = fs.lstatSync(dir);
+    }
+    if (!st.isDirectory() || st.uid !== process.getuid() || (st.mode & 0o077) !== 0) {
+      throw new Error('каталог сокетов Tor занят другим пользователем или открыт посторонним: ' + dir);
+    }
+    for (const stale of [socks, control]) fs.rmSync(stale, { force: true });
   }
 
   // Как движку и панели подключаться к этому Tor.
@@ -113,18 +152,24 @@ class TorManager extends EventEmitter {
       ipc ? `SocksPort unix:${ipc.socks}` : `SocksPort 127.0.0.1:${SOCKS_PORT}`,
       ipc ? `ControlPort unix:${ipc.control}` : `ControlPort 127.0.0.1:${CONTROL_PORT}`,
       'CookieAuthentication 1',
-      `CookieAuthFile "${fwd(this.cookieFile)}"`,
-      `DataDirectory "${fwd(this.dataDir)}"`,
+      `CookieAuthFile ${quotePath(this.cookieFile)}`,
+      `DataDirectory ${quotePath(this.dataDir)}`,
     ];
     for (const [opt, file] of [['GeoIPFile', 'geoip'], ['GeoIPv6File', 'geoip6']]) {
       const p = path.join(paths.geoipDir, file);
-      if (fs.existsSync(p)) lines.push(`${opt} "${fwd(p)}"`);
+      if (fs.existsSync(p)) lines.push(`${opt} ${quotePath(p)}`);
     }
 
     const bridgeLines = String(bridges || '').split(/[\r\n]+/).map((l) => l.trim().replace(/^bridge\s+/i, '')).filter(Boolean);
     if (bridgeLines.length) {
       lines.push('UseBridges 1');
-      if (fs.existsSync(paths.lyrebird)) lines.push(`ClientTransportPlugin meek_lite,obfs4,scramblesuit,webtunnel exec "${fwd(paths.lyrebird)}"`);
+      // Tor делит эту директиву по пробелам и кавычек внутри не понимает, поэтому
+      // путь к программе-транспорту задаётся относительно папки Tor (она же —
+      // рабочая папка процесса, см. start): в нём нет ни пробелов, ни спецсимволов.
+      if (fs.existsSync(paths.lyrebird)) {
+        const rel = path.relative(path.dirname(paths.tor), paths.lyrebird).split(path.sep).join('/');
+        if (/^[A-Za-z0-9._/-]+$/.test(rel) && !rel.startsWith('..')) lines.push(`ClientTransportPlugin meek_lite,obfs4,scramblesuit,webtunnel exec ./${rel}`);
+      }
       for (const b of bridgeLines) lines.push(`Bridge ${b}`);
     }
 
@@ -180,17 +225,24 @@ class TorManager extends EventEmitter {
     try { fs.rmSync(this.cookieFile, { force: true }); } catch { /* не критично */ }
     // Прежние версии писали конфигурацию (с паролем прокси) в файл — убираем его.
     try { fs.rmSync(path.join(this.dataDir, 'torrc'), { force: true }); } catch { /* не критично */ }
-    for (const stale of ['socks.sock', 'control.sock']) {
-      try { fs.rmSync(path.join(this.dataDir, stale), { force: true }); } catch { /* не критично */ }
+    if (this.ipc) {
+      try {
+        this._prepareSocketDir();
+      } catch (e) {
+        // Сокеты недоступны — Tor не запускается. Молчаливого отката на TCP нет.
+        this._set('error', 'Tor не запущен: ' + e.message, 0);
+        return;
+      }
     }
 
     this._dropEvents(); // соединение с прежним процессом Tor, если он упал сам
     this._set('starting', 'Запуск Tor…', 0);
     // Linux-сборка Tor несёт свои библиотеки (libevent, libssl) рядом с бинарником.
     const env = { ...process.env };
-    if (process.platform !== 'win32') env.LD_LIBRARY_PATH = [path.dirname(paths.tor), env.LD_LIBRARY_PATH].filter(Boolean).join(':');
+    if (!WIN) env.LD_LIBRARY_PATH = [path.dirname(paths.tor), env.LD_LIBRARY_PATH].filter(Boolean).join(':');
     // Конфигурация передаётся через stdin («-f -») и на диск не попадает.
-    const proc = spawn(paths.tor, ['-f', '-'], { windowsHide: true, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    // Рабочая папка — папка Tor: от неё отсчитывается путь к транспорту мостов.
+    const proc = spawn(paths.tor, ['-f', '-'], { windowsHide: true, env, cwd: path.dirname(paths.tor), stdio: ['pipe', 'pipe', 'pipe'] });
     this.proc = proc;
     proc.stdin.on('error', () => { /* процесс не запустился — об этом сообщит событие error/exit */ });
     proc.stdin.end(config);
@@ -246,7 +298,10 @@ class TorManager extends EventEmitter {
   // сначала сервер доказывает, что знает cookie. Подставной процесс, занявший
   // порт, проверку не пройдёт и ничего секретного не получит.
   // Возвращает { send(команда) -> Promise<{ code, lines }>, close() }.
-  _connect({ onEvent, timeoutMs = 5000 } = {}) {
+  // timeoutMs — предел молчания сокета; deadlineMs — предел на всё соединение
+  // целиком (его нельзя растянуть, присылая данные по капле); onClosed
+  // вызывается, когда уже установленное соединение оборвалось.
+  _connect({ onEvent, onClosed, timeoutMs = 5000, deadlineMs = 15000 } = {}) {
     return new Promise((resolve, reject) => {
       let cookie;
       try { cookie = fs.readFileSync(this.cookieFile); } catch (e) { reject(new Error('нет файла cookie Tor: ' + e.message)); return; }
@@ -256,28 +311,39 @@ class TorManager extends EventEmitter {
       const sock = ipc ? net.connect({ path: ipc.control }) : net.connect(CONTROL_PORT, '127.0.0.1');
       const pending = [];
       let closed = false;
+      let established = false;
       let failure = null;
+      let deadline = null;
       const fail = (err) => {
         if (closed) return;
         closed = true;
         failure = err;
+        clearTimeout(deadline);
         sock.destroy();
         for (const p of pending.splice(0)) p.reject(err);
         reject(err); // не действует, если соединение уже установлено
+        if (established && onClosed) onClosed(err);
       };
+      deadline = setTimeout(() => fail(new Error('Tor не уложился в отведённое время на control-порту')), deadlineMs);
       const reader = new ReplyReader((reply) => {
         // 6xx — асинхронные события, а не ответы на команды.
         if (reply.code[0] === '6') { if (onEvent) onEvent(reply); return; }
         const p = pending.shift();
         if (p) p.resolve(reply);
-      });
+      }, () => fail(new Error('слишком большой ответ на control-порту')));
       const send = (command) => new Promise((res, rej) => {
         if (closed) { rej(failure || new Error('соединение с Tor закрыто')); return; }
         if (hasControlChars(command)) { rej(new Error('недопустимые символы в команде Tor')); return; }
         pending.push({ resolve: res, reject: rej });
         sock.write(command + '\r\n');
       });
-      const close = () => { if (!closed) { closed = true; sock.destroy(); for (const p of pending.splice(0)) p.reject(new Error('соединение с Tor закрыто')); } };
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        clearTimeout(deadline);
+        sock.destroy();
+        for (const p of pending.splice(0)) p.reject(new Error('соединение с Tor закрыто'));
+      };
 
       sock.setEncoding('utf8');
       sock.setTimeout(timeoutMs, () => fail(new Error('Tor не ответил на control-порту')));
@@ -298,7 +364,13 @@ class TorManager extends EventEmitter {
           const proof = crypto.createHmac('sha256', CONTROLLER_TO_SERVER).update(material).digest('hex');
           const auth = await send('AUTHENTICATE ' + proof);
           if (auth.code !== '250') throw new Error('Tor отклонил аутентификацию: ' + auth.code);
-          resolve({ send, close, setTimeout: (ms) => sock.setTimeout(ms) });
+          established = true;
+          resolve({
+            send,
+            close,
+            // Для долгоживущей подписки на события: снять оба ограничения по времени.
+            keepOpen: () => { clearTimeout(deadline); sock.setTimeout(0); },
+          });
         } catch (e) { fail(e); }
       });
     });
@@ -310,21 +382,34 @@ class TorManager extends EventEmitter {
     if (this.events) return;
     const marker = {};
     this.events = marker; // занято, пока идёт подключение
+    let conn = null;
+    // Подписка оборвалась или не установилась, а Tor работает — пробуем снова,
+    // иначе схема маршрута перестала бы обновляться до перезапуска Tor.
+    const retryLater = () => {
+      const proc = this.proc;
+      setTimeout(() => { if (this.proc === proc && proc && this.status === 'ready' && !this.events) this._watchStreams(); }, 3000);
+    };
     try {
-      const conn = await this._connect({
+      conn = await this._connect({
         onEvent: (reply) => {
           // SENTCONNECT — момент, когда соединение отправлено по цепочке; здесь ещё
           // виден домен сайта (в более поздних событиях он заменяется на IP).
           const m = reply.lines[0].match(/^STREAM \d+ SENTCONNECT (\d+) (\S+)/);
           if (m && m[1] !== '0' && !/\.exit:\d+$/.test(m[2])) this.emit('stream', { circuitId: m[1], target: m[2].replace(/:\d+$/, '') });
         },
+        onClosed: () => {
+          if (this.events !== conn) return; // соединение закрыли мы сами
+          this.events = null;
+          retryLater();
+        },
       });
       const reply = await conn.send('SETEVENTS STREAM');
       if (reply.code !== '250') throw new Error('Tor отклонил подписку на события: ' + reply.code);
-      conn.setTimeout(0); // событий может не быть сколько угодно долго
+      conn.keepOpen(); // событий может не быть сколько угодно долго
       if (this.events === marker) this.events = conn; else conn.close(); // пока подключались, Tor остановили
     } catch {
-      if (this.events === marker) this.events = null; // схема маршрута просто не будет обновляться
+      if (conn) conn.close();
+      if (this.events === marker) { this.events = null; retryLater(); }
     }
   }
 
@@ -406,4 +491,4 @@ class TorManager extends EventEmitter {
   }
 }
 
-module.exports = { TorManager, SOCKS_PORT, CONTROL_PORT };
+module.exports = { TorManager, ReplyReader, SOCKS_PORT, CONTROL_PORT };
