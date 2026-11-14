@@ -18,6 +18,10 @@ const rebrand = require('./rebrand');
 const SELFTEST = process.argv.includes('--selftest');
 // brauser --open=https://example.org — сразу открыть адрес в защищённом браузере.
 const OPEN_URL = (process.argv.find((a) => /^--open=https?:\/\//i.test(a)) || '').slice('--open='.length) || undefined;
+// brauser --report-settings — показать, как прочитаны настройки, и выйти (без сети).
+const REPORT_SETTINGS = process.argv.includes('--report-settings');
+// BRAUSER_USER_DATA — другая папка данных (для проверок и переносной установки).
+if (process.env.BRAUSER_USER_DATA) app.setPath('userData', path.resolve(process.env.BRAUSER_USER_DATA));
 const TRACE = process.env.BRAUSER_TRACE;
 const trace = (m) => { if (TRACE) fs.appendFileSync(TRACE, m + '\n'); };
 
@@ -55,23 +59,62 @@ function secretStoreAvailable() {
   } catch { return false; }
 }
 
+// Причина, по которой Secured нельзя запускать с загруженными настройками.
+// Главный случай — пользователь настроил прокси перед Tor (чтобы провайдер не
+// видел Tor), а восстановить этот прокси не удалось: запускать Tor напрямую
+// нельзя. Блокировка снимается, только когда пользователь сам нажмёт
+// «Применить» в настройках — с новым адресом прокси или с пустым полем.
+let settingsBlock = '';
+// Нерасшифрованный прокси из файла: бережём, пока пользователь не решит, что с ним делать.
+let keptProxyEnc = '';
+// Сообщения о проблемах при запуске — показываются, когда откроется панель.
+const startupNotices = [];
+
+const BLOCK_HINT = ' Режим Secured не запущен, чтобы не подключаться к Tor в обход прокси. Проверьте поле «Прокси перед Tor» в настройках: впишите адрес заново или оставьте поле пустым — и нажмите «Применить».';
+
 function loadSettings() {
+  settings = { ...DEFAULTS };
+  settingsBlock = '';
+  keptProxyEnc = '';
+  const file = settingsFile();
+  let raw = null;
   try {
-    const saved = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
-    settings = { ...DEFAULTS };
-    for (const k of Object.keys(DEFAULTS)) if (typeof saved[k] === typeof DEFAULTS[k]) settings[k] = saved[k];
-    if (typeof saved.upstreamProxyEnc === 'string' && saved.upstreamProxyEnc) {
-      try { settings.upstreamProxy = safeStorage.decryptString(Buffer.from(saved.upstreamProxyEnc, 'base64')); } catch { settings.upstreamProxy = ''; }
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    // Файла нет — первый запуск. Любая другая ошибка — настройки есть, но недоступны.
+    if (e.code !== 'ENOENT') settingsBlock = `Файл настроек не читается (${e.code}).`;
+  }
+  if (raw !== null) {
+    let saved = null;
+    try { saved = JSON.parse(raw); } catch { /* повреждён */ }
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) {
+      try { fs.copyFileSync(file, file + '.broken'); } catch { /* копия не обязательна */ }
+      settingsBlock = 'Файл настроек повреждён (его копия сохранена как settings.json.broken).';
+    } else {
+      for (const k of Object.keys(DEFAULTS)) if (typeof saved[k] === typeof DEFAULTS[k]) settings[k] = saved[k];
+      if (typeof saved.upstreamProxyEnc === 'string' && saved.upstreamProxyEnc) {
+        try {
+          settings.upstreamProxy = safeStorage.decryptString(Buffer.from(saved.upstreamProxyEnc, 'base64'));
+        } catch {
+          settings.upstreamProxy = '';
+          keptProxyEnc = saved.upstreamProxyEnc;
+          settingsBlock = 'Сохранённый прокси перед Tor не удалось расшифровать — так бывает после переноса профиля на другой компьютер или к другому пользователю.';
+        }
+      }
+      // Сохранённый адрес прокси проходит ту же проверку, что и введённый в панели.
+      if (settings.upstreamProxy && !parseProxy(settings.upstreamProxy)) {
+        settings.upstreamProxy = '';
+        settingsBlock = 'Сохранённый адрес прокси перед Tor некорректен.';
+      }
     }
-    // Сохранённый адрес прокси проходит ту же проверку, что и введённый в панели.
-    if (settings.upstreamProxy && !parseProxy(settings.upstreamProxy)) settings.upstreamProxy = '';
-  } catch { settings = { ...DEFAULTS }; }
+  }
   if (!['secured', 'basic'].includes(settings.mode)) settings.mode = 'secured';
-  if (SELFTEST) settings = { ...DEFAULTS, autoLaunch: false, bridges: process.env.BRAUSER_BRIDGES || '' };
+  if (SELFTEST) { settings = { ...DEFAULTS, autoLaunch: false, bridges: process.env.BRAUSER_BRIDGES || '' }; settingsBlock = ''; keptProxyEnc = ''; }
 }
 
+// Возвращает true, если настройки записаны.
 function saveSettings() {
-  if (SELFTEST) return;
+  if (SELFTEST) return true;
   try {
     const out = { ...settings };
     // Адрес прокси может содержать пароль: при наличии хранилища секретов ОС он
@@ -79,11 +122,35 @@ function saveSettings() {
     if (out.upstreamProxy && secretStoreAvailable()) {
       out.upstreamProxyEnc = safeStorage.encryptString(out.upstreamProxy).toString('base64');
       out.upstreamProxy = '';
+    } else if (keptProxyEnc) {
+      out.upstreamProxyEnc = keptProxyEnc; // решения по нему ещё не было — не стираем
     }
+    // Запись атомарная: новый файл появляется целиком или не появляется вовсе,
+    // так что сбой посреди записи не оставит обрезанных настроек.
     const file = settingsFile();
-    fs.writeFileSync(file, JSON.stringify(out, null, 2), { mode: 0o600 });
-    fs.chmodSync(file, 0o600); // файл мог существовать с более широкими правами
-  } catch { /* не критично */ }
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(out, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return true;
+  } catch { return false; }
+}
+
+// Однократная уборка при запуске, независимо от того, будет ли запущен Tor:
+// прежние версии хранили пароль прокси открытым текстом в двух местах.
+function migrateOldSecrets(torDataDir) {
+  try {
+    fs.rmSync(path.join(torDataDir, 'torrc'), { force: true });
+  } catch (e) {
+    startupNotices.push('Не удалось удалить старый файл конфигурации Tor (в нём мог остаться пароль прокси): ' + e.message);
+  }
+  if (SELFTEST || !fs.existsSync(settingsFile())) return;
+  if (settingsBlock) {
+    // Настройки не разобраны — содержимое не трогаем, только закрываем файл от посторонних.
+    try { fs.chmodSync(settingsFile(), 0o600); } catch { /* не критично */ }
+    return;
+  }
+  // Пересохранение шифрует адрес прокси, если он лежал открытым текстом, и выставляет права 0600.
+  if (!saveSettings()) startupNotices.push('Не удалось пересохранить настройки в защищённом виде — проверьте доступ к папке данных Brauser.');
 }
 
 // ---------------------------------------------------------------- состояние для интерфейса
@@ -96,10 +163,11 @@ function sendState() {
     statePending = false;
     if (!win || win.isDestroyed()) return;
     const up = parseProxy(settings.upstreamProxy);
+    if (!engine || !tor) return;
     win.webContents.send('state', {
       fatal,
       installing: engine.installing,
-      tor: { status: tor.status, progress: tor.progress, message: tor.message },
+      tor: { status: tor.status, progress: tor.progress, message: tor.message, transport: tor.transport },
       browser: { running: engine.running, error: engine.error },
       route: {
         real: settings.showRealIp ? realIp : null,
@@ -118,8 +186,14 @@ function notify(text) {
 
 // ---------------------------------------------------------------- Tor и движок
 
+// Запускает Tor, только если настройки загружены достоверно (см. settingsBlock).
 function startTor() {
   circuit = null;
+  if (settingsBlock) {
+    fatal = settingsBlock + BLOCK_HINT;
+    sendState();
+    return;
+  }
   tor.start(engine.paths, settings);
 }
 
@@ -171,6 +245,7 @@ function boot() {
 
 async function bootSecured() {
   if (tor.status === 'starting' || tor.status === 'ready') return;
+  if (settingsBlock) { startTor(); return; } // покажет причину и ничего не запустит
   fatal = '';
   try {
     await engine.ensureInstalled();
@@ -235,13 +310,16 @@ const fromPanel = (fn) => (event, arg) => {
 };
 
 function registerIpc() {
-  ipcMain.handle('state:get', fromPanel(() => { sendState(); }));
+  ipcMain.handle('state:get', fromPanel(() => {
+    for (const text of startupNotices.splice(0)) notify(text);
+    sendState();
+  }));
   ipcMain.handle('browser:launch', fromPanel(() => launchBrowser()));
   ipcMain.handle('basic:open', fromPanel(() => { basic.open(); }));
   ipcMain.handle('mode:set', fromPanel((mode) => {
     if (!['secured', 'basic'].includes(mode) || mode === settings.mode) return;
     settings.mode = mode;
-    saveSettings();
+    if (!settingsBlock) saveSettings(); // при блокировке файл настроек не трогаем
     if (mode === 'secured') boot();
     else if (!engine.running) tor.stop(); // защищённый браузер закрыт — Tor больше не нужен
     sendState();
@@ -270,11 +348,17 @@ function registerIpc() {
     for (const k of ['showRealIp', 'autoLaunch']) if (typeof patch[k] === 'boolean') next[k] = patch[k];
 
     const torChanged = ['bridges', 'exitCountry', 'upstreamProxy'].some((k) => next[k] !== settings[k]);
+    // «Применить» с принятым полем прокси (новый адрес или пустое) — это и есть
+    // решение пользователя, которого ждала блокировка.
+    const proxyDecided = typeof patch.upstreamProxy === 'string' && next.upstreamProxy === patch.upstreamProxy.trim();
+    const wasBlocked = !!settingsBlock;
+    if (wasBlocked && proxyDecided) { settingsBlock = ''; keptProxyEnc = ''; fatal = ''; }
     settings = next;
-    saveSettings();
+    if (!settingsBlock && !saveSettings()) notify('Не удалось сохранить настройки на диск');
     if (!settings.showRealIp) realIp = null;
     else probeRealIp();
-    if (torChanged && engine.installed) { tor.stop(); startTor(); }
+    if (wasBlocked && !settingsBlock) { if (settings.mode === 'secured') boot(); }
+    else if (torChanged && engine.installed) { tor.stop(); startTor(); }
     sendState();
   }));
 }
@@ -290,7 +374,7 @@ async function runSelfTest() {
   if (tor.status === 'ready') {
     // Control-порт: SAFECOOKIE работает, отказ Tor не принимается за успех,
     // конфигурация с диска не читается.
-    result.transport = tor.ipc ? 'unix-сокеты' : 'tcp 127.0.0.1';
+    result.transport = tor.ipc ? 'unix-сокеты: ' + tor.ipc.dir : 'tcp 127.0.0.1';
     result.control = {
       newnym: await tor.newnym().then(() => true, (e) => e.message),
       badCommandRejected: await tor.control(['SIGNAL NOSUCHSIGNAL']).then(() => false, (e) => e.message),
@@ -338,6 +422,7 @@ if (!app.requestSingleInstanceLock()) {
       bundleDirs: [path.join(process.resourcesPath, 'tor-browser-bundle'), path.join(app.getAppPath(), 'vendor')],
     });
     tor = new TorManager({ dataDir: path.join(userData, 'tor-data') });
+    migrateOldSecrets(tor.dataDir);
 
     let wasReady = false;
     tor.on('change', () => {
@@ -356,6 +441,18 @@ if (!app.requestSingleInstanceLock()) {
       if (!engine.running && settings.mode === 'basic' && tor.status !== 'stopped') tor.stop();
       sendState();
     });
+
+    if (REPORT_SETTINGS) {
+      // Запуск Secured пробуем только при блокировке: он должен отказаться и ничего не запустить.
+      if (settingsBlock) await boot();
+      console.log('SETTINGS ' + JSON.stringify({
+        block: settingsBlock, fatal, torStatus: tor.status, mode: settings.mode,
+        proxy: settings.upstreamProxy ? 'задан' : 'пуст', keptEncrypted: !!keptProxyEnc,
+        secretStore: secretStoreAvailable(), notices: startupNotices,
+      }, null, 2));
+      app.quit();
+      return;
+    }
 
     registerIpc();
     createWindow();

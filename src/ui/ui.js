@@ -123,6 +123,9 @@ function renderSecuredRoute() {
 
   drawFlow($('routeflow'), nodes, linkClass);
   $('routenote').textContent = note;
+  $('transport').textContent = tor.transport === 'unix'
+    ? 'Локальный доступ к Tor: Unix-сокеты, открытые только вашему пользователю.'
+    : 'Локальный доступ к Tor: TCP 127.0.0.1 (порты 9250 и 9251) — другие программы и пользователи этого компьютера тоже могут к нему подключиться.';
 }
 
 function renderBasicRoute() {
