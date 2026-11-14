@@ -100,7 +100,9 @@ class BrowserEngine extends EventEmitter {
       this.error = 'Не удалось запустить браузер: ' + e.message;
       this.emit('change');
     });
-    proc.on('exit', () => {
+    const startedAt = Date.now();
+    proc.on('exit', (code) => {
+      this.lastExit = { code, afterMs: Date.now() - startedAt };
       if (this.proc === proc) this.proc = null;
       this.emit('change');
     });

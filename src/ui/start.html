@@ -12,7 +12,7 @@
     }
     h1 { margin: 0; font-size: 34px; font-weight: 600; letter-spacing: .02em; }
     form { width: min(560px, 80vw); }
-    input {
+    input[type=text] {
       width: 100%; box-sizing: border-box; height: 46px; padding: 0 20px;
       background: #1c1f25; color: inherit; font: inherit; border: 1px solid #333843; border-radius: 23px; outline: none;
     }
@@ -24,7 +24,22 @@
 <body>
   <h1>Brauser</h1>
   <form action="https://duckduckgo.com/" method="get">
-    <input name="q" type="text" autofocus autocomplete="off" placeholder="Поиск в DuckDuckGo">
+    <input name="q" type="text" autofocus autocomplete="off" placeholder="Поиск">
+    <!-- оформление результатов: те же параметры, что в src/search.js -->
+    <input type="hidden" name="kae" value="d">
+    <input type="hidden" name="k7" value="14161a">
+    <input type="hidden" name="kj" value="14161a">
+    <input type="hidden" name="k9" value="8ab4ff">
+    <input type="hidden" name="kaa" value="c08be0">
+    <input type="hidden" name="kx" value="3ecf8e">
+    <input type="hidden" name="k8" value="c9ccd3">
+    <input type="hidden" name="km" value="m">
+    <input type="hidden" name="k1" value="-1">
+    <input type="hidden" name="kak" value="-1">
+    <input type="hidden" name="kax" value="-1">
+    <input type="hidden" name="kaq" value="-1">
+    <input type="hidden" name="kap" value="-1">
+    <input type="hidden" name="kao" value="-1">
   </form>
   <p>Режим Basic: прямое соединение без Tor. Для анонимности откройте режим Secured в панели.</p>
   <footer>Barathrum Co. · pulpadulpa</footer>

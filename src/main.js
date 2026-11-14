@@ -12,8 +12,11 @@ const { TorManager } = require('./tor');
 const { BrowserEngine } = require('./browser');
 const { parseProxy } = require('./proxy');
 const basic = require('./basic');
+const rebrand = require('./rebrand');
 
 const SELFTEST = process.argv.includes('--selftest');
+// brauser --open=https://example.org — сразу открыть адрес в защищённом браузере.
+const OPEN_URL = (process.argv.find((a) => /^--open=https?:\/\//i.test(a)) || '').slice('--open='.length) || undefined;
 const TRACE = process.env.BRAUSER_TRACE;
 const trace = (m) => { if (TRACE) fs.appendFileSync(TRACE, m + '\n'); };
 
@@ -142,9 +145,23 @@ async function bootSecured() {
   try {
     await engine.ensureInstalled();
   } catch (e) {
-    fatal = 'Не удалось подготовить движок Tor Browser: ' + e.message;
+    fatal = 'Не удалось подготовить движок: ' + e.message;
     sendState();
     return;
+  }
+  // Название, логотипы и стартовая страница Brauser. Движок при этом должен быть закрыт.
+  if (!engine.running) {
+    try {
+      const changed = rebrand.apply({
+        root: engine.root,
+        assetsDir: path.join(app.getAppPath(), 'assets', 'brand'),
+        startPage: path.join(__dirname, 'ui', 'secured-start.html'),
+      });
+      trace('rebrand ' + (changed ? 'applied' : 'already in place'));
+    } catch (e) {
+      trace('rebrand failed: ' + e.message);
+      notify('Не удалось применить оформление Brauser к движку: ' + e.message);
+    }
   }
   startTor();
 }
@@ -277,13 +294,14 @@ if (!app.requestSingleInstanceLock()) {
       const ready = tor.status === 'ready';
       if (ready && !wasReady) {
         probeRealIp();
-        if (settings.autoLaunch && settings.mode === 'secured' && !engine.running) engine.launch(tor.cookieFile);
+        if ((settings.autoLaunch || OPEN_URL) && settings.mode === 'secured' && !engine.running) engine.launch(tor.cookieFile, OPEN_URL);
       }
       wasReady = ready;
       sendState();
     });
     tor.on('stream', onStream);
     engine.on('change', () => {
+      trace('engine running=' + engine.running + ' lastExit=' + JSON.stringify(engine.lastExit || null) + ' error=' + engine.error);
       // Защищённый браузер закрыли, а режим уже Basic — останавливаем и Tor.
       if (!engine.running && settings.mode === 'basic' && tor.status !== 'stopped') tor.stop();
       sendState();

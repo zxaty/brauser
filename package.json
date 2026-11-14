@@ -1,7 +1,7 @@
 {
   "name": "brauser",
   "productName": "Brauser",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Brauser: панель управления и движок Tor Browser (Secured) плюс обычный быстрый браузер (Basic)",
   "author": {
     "name": "Brauser",
@@ -24,6 +24,7 @@
     },
     "files": [
       "src/**/*",
+      "assets/**/*",
       "package.json"
     ],
     "win": {
@@ -84,5 +85,8 @@
     "electron": "^45.3.2",
     "electron-builder": "^26.18.0"
   },
-  "homepage": "https://brauser.invalid"
+  "homepage": "https://brauser.invalid",
+  "dependencies": {
+    "fflate": "^0.8.3"
+  }
 }

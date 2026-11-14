@@ -8,6 +8,7 @@ const { BrowserWindow, WebContentsView, session } = require('electron');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { isBlocked } = require('./blocklist');
+const { searchUrl } = require('./search');
 
 const START_URL = pathToFileURL(path.join(__dirname, 'ui', 'start.html')).href;
 const TOOLBAR_H = 84;
@@ -85,7 +86,7 @@ function toUrl(input) {
   if (/^https?:\/\//i.test(s)) return s;
   // Прочие схемы (file:, javascript:, chrome: …) из адресной строки не открываем.
   if (!/\s/.test(s) && !/^[a-z][a-z0-9+.-]*:(?!\d)/i.test(s) && /^(localhost|[^\s/?#]+\.[^\s/?#.]{2,})(:\d+)?([/?#].*)?$/i.test(s)) return 'https://' + s;
-  return 'https://duckduckgo.com/?q=' + encodeURIComponent(s);
+  return searchUrl(s);
 }
 
 const activeWc = () => (tabs.get(activeId) ? tabs.get(activeId).view.webContents : null);
