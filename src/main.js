@@ -40,6 +40,8 @@ let identityCount = 0;
 let busy = false;
 let panelOpen = false;
 let rotateTimer = null;
+let realIp = null;   // настоящий IP пользователя (узнаётся один раз, только для схемы маршрута)
+let circuit = null;  // текущая цепочка Tor
 let activeId = null;
 let nextTabId = 1;
 const tabs = new Map(); // id -> { id, view }
@@ -92,6 +94,12 @@ function sendState() {
       settings,
       tor: { status: tor.status, progress: tor.progress, message: tor.message },
       proxyCount: proxies.length,
+      route: identity && {
+        real: settings.mode === 'direct' ? (identity.ip ? { ip: identity.ip, country: identity.country } : null) : (settings.checkIp ? realIp : null),
+        circuit,
+        proxy: identity.proxy ? { scheme: identity.proxy.scheme, host: identity.proxy.host, port: identity.proxy.port } : null,
+        exit: identity.ip ? { ip: identity.ip, country: identity.country } : null,
+      },
       identity: identity && {
         n: identity.n,
         ip: identity.ip,
@@ -142,6 +150,30 @@ async function applyProxy() {
 // Узнаём внешний IP (и часовой пояс по нему) запросом через текущую сессию,
 // то есть через тот же прокси/Tor, что и страницы.
 async function lookupIp() {
+  await lookupExitIp();
+  await refreshRoute();
+}
+
+// Данные для схемы маршрута: узлы цепочки Tor и настоящий IP пользователя.
+async function refreshRoute() {
+  circuit = null;
+  if (settings.mode === 'tor' && tor.status === 'ready') {
+    try { circuit = await tor.circuit(identity.ip); } catch { circuit = null; }
+  }
+  // Настоящий IP нужен только чтобы показать начало маршрута. Запрос идёт
+  // напрямую, мимо прокси, поэтому делается один раз и только если показ IP включён.
+  if (settings.checkIp && settings.mode !== 'direct' && !realIp) {
+    try {
+      const direct = session.fromPartition('direct-probe');
+      await direct.setProxy({ mode: 'direct' });
+      const res = await direct.fetch('https://ipwho.is/', { signal: AbortSignal.timeout(8000), cache: 'no-store' });
+      const d = await res.json();
+      if (d && d.ip) realIp = { ip: d.ip, country: d.country_code || null };
+    } catch { /* без него схема просто покажет «ваш IP» */ }
+  }
+}
+
+async function lookupExitIp() {
   const id = identity;
   id.ip = null; id.country = null; id.geoTimezone = null;
   if (!settings.checkIp) return;
@@ -610,6 +642,7 @@ app.whenReady().then(async () => {
           for (let i = 0; i < 2; i++) { await rotateIp(true); second.tor.ips.push([identity.ip, identity.country, effectiveTimezone()]); }
         }
       }
+      second.route = { circuit, realKnown: !!realIp };
       await new Promise((r) => setTimeout(r, 300));
       second.ui = await win.webContents.executeJavaScript(`(async () => {
         document.getElementById('gear').click();
@@ -623,6 +656,11 @@ app.whenReady().then(async () => {
           torStatus: document.getElementById('torstatus').textContent,
         };
       })()`);
+      if (process.env.BRAUSER_SHOT) {
+        win.show();
+        await new Promise((r) => setTimeout(r, 1200));
+        fs.writeFileSync(process.env.BRAUSER_SHOT, (await win.webContents.capturePage()).toPNG());
+      }
       console.log('SELFTEST ' + JSON.stringify({ expected: { cores: persona1.hardwareConcurrency, gpu: persona1.gpu.renderer, screen: persona1.screen.width }, first, second }, null, 2));
     } catch (e) {
       console.log('SELFTEST FAILED ' + (e && e.stack || e));

@@ -1,7 +1,7 @@
 {
   "name": "brauser",
   "productName": "Brauser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Приватный браузер: подмена отпечатка, Tor и ротация прокси",
   "author": {
     "name": "Brauser",

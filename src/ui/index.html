@@ -17,7 +17,7 @@
       <button id="forward" title="Вперёд">→</button>
       <button id="reload" title="Обновить (Ctrl+R)">⟳</button>
       <form id="addrform"><input id="addr" type="text" spellcheck="false" autocomplete="off" placeholder="Адрес или поисковый запрос"></form>
-      <span id="chip" title="Текущий маршрут"></span>
+      <span id="chip" title="Показать маршрут"></span>
       <button id="rotate" class="wide" title="Сменить маршрут, вкладки остаются (Ctrl+Shift+I)">Сменить IP</button>
       <button id="ident" class="wide accent" title="Новый IP, новый отпечаток, куки и вкладки стираются (Ctrl+Shift+N)">Новая личность</button>
       <button id="gear" title="Настройки">⚙</button>
@@ -25,6 +25,12 @@
   </header>
 
   <main id="panel" hidden>
+    <section id="route">
+      <h2>Маршрут</h2>
+      <div id="routeflow" class="flow"></div>
+      <p id="routenote" class="hint"></p>
+    </section>
+
     <div class="cols">
       <section>
         <h2>Сеть</h2>
@@ -52,7 +58,7 @@
         <h2>Защита</h2>
         <label class="check"><input id="spoof" type="checkbox"> Подменять отпечаток браузера</label>
         <label class="check"><input id="block" type="checkbox"> Блокировать трекеры и рекламные сети</label>
-        <label class="check"><input id="checkip" type="checkbox"> Показывать внешний IP <small>один запрос к ipwho.is через текущий маршрут</small></label>
+        <label class="check"><input id="checkip" type="checkbox"> Показывать IP на схеме <small>запросы к ipwho.is: через текущий маршрут и один раз напрямую, чтобы узнать ваш IP</small></label>
         <label>Часовой пояс
           <select id="tz">
             <option value="auto">Авто — по выходному IP</option>

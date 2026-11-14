@@ -24,6 +24,8 @@ class TorManager extends EventEmitter {
     this.progress = 0;
     this.message = '';
     this.lastNewnym = 0;
+    this.events = null;       // постоянное соединение с control-портом для событий
+    this.lastCircuitId = null; // цепочка, по которой ушло последнее соединение
   }
 
   get socksRules() { return `socks5://127.0.0.1:${SOCKS_PORT}`; }
@@ -127,7 +129,7 @@ class TorManager extends EventEmitter {
         const m = line.match(/Bootstrapped (\d+)%[^:]*:\s*(.*)$/);
         if (m) {
           const pct = Number(m[1]);
-          if (pct >= 100) this._set('ready', 'Подключено', 100);
+          if (pct >= 100) { this._set('ready', 'Подключено', 100); this._watchStreams(); }
           else this._set('starting', m[2], pct);
         } else if (/\[err\]/.test(line)) {
           this.message = line.replace(/^.*\[err\]\s*/, '');
@@ -150,11 +152,109 @@ class TorManager extends EventEmitter {
     });
   }
 
+  // Подписка на события потоков: так мы знаем, по какой именно цепочке
+  // реально ушёл последний запрос, и показываем в схеме её, а не случайную.
+  _watchStreams() {
+    if (this.events) return;
+    let cookie;
+    try { cookie = fs.readFileSync(path.join(this.dataDir, 'control_auth_cookie')).toString('hex'); } catch { return; }
+    const sock = net.connect(CONTROL_PORT, '127.0.0.1');
+    this.events = sock;
+    let buf = '';
+    sock.on('connect', () => sock.write(`AUTHENTICATE ${cookie}\r\nSETEVENTS STREAM\r\n`));
+    sock.on('data', (d) => {
+      buf += d.toString();
+      const lines = buf.split(/\r?\n/);
+      buf = lines.pop();
+      for (const line of lines) {
+        const m = line.match(/^650 STREAM \d+ SUCCEEDED (\d+) /);
+        if (m && m[1] !== '0') this.lastCircuitId = m[1];
+      }
+    });
+    const drop = () => { if (this.events === sock) this.events = null; };
+    sock.on('error', drop);
+    sock.on('close', drop);
+  }
+
   stop() {
+    if (this.events) { this.events.destroy(); this.events = null; }
+    this.lastCircuitId = null;
     const proc = this.proc;
     this.proc = null;
     if (proc) { try { proc.kill(); } catch { /* уже завершён */ } }
     if (this.status !== 'missing') this._set('stopped', '', 0);
+  }
+
+  // Отправляет команды на control-порт и возвращает сырой ответ Tor.
+  control(commands) {
+    const cookie = fs.readFileSync(path.join(this.dataDir, 'control_auth_cookie')).toString('hex');
+    return new Promise((resolve, reject) => {
+      const sock = net.connect(CONTROL_PORT, '127.0.0.1');
+      let out = '';
+      const timer = setTimeout(() => { sock.destroy(); reject(new Error('Tor не ответил на control-порту')); }, 5000);
+      sock.on('connect', () => sock.write([`AUTHENTICATE ${cookie}`, ...commands, 'QUIT', ''].join('\r\n')));
+      sock.on('data', (d) => { out += d.toString(); });
+      sock.on('error', (e) => { clearTimeout(timer); reject(e); });
+      sock.on('close', () => {
+        clearTimeout(timer);
+        /^250 OK/m.test(out) ? resolve(out) : reject(new Error('Tor отклонил команду: ' + out.trim().split(/\r?\n/)[0]));
+      });
+    });
+  }
+
+  // Возвращает текущую цепочку: входной, промежуточный и выходной узлы с IP и
+  // страной. Если известен внешний IP, выбирается цепочка с таким выходом,
+  // иначе — самая свежая.
+  async circuit(exitIpHint) {
+    if (this.status !== 'ready') return null;
+    const raw = await this.control(['GETINFO circuit-status']);
+    const circuits = [];
+    for (const line of raw.split(/\r?\n/)) {
+      const m = line.match(/^(\d+) BUILT (\S+) (.*)$/);
+      // CONFLUX_LINKED — «сдвоенные» цепочки новых версий Tor, обычный трафик часто идёт по ним.
+      if (!m || !/PURPOSE=(GENERAL|CONFLUX_LINKED)\b/.test(m[3])) continue;
+      const hops = m[2].split(',').map((h) => {
+        const [fp, nickname] = h.replace(/^\$/, '').split(/[~=]/);
+        return { fp, nickname: nickname || '' };
+      });
+      if (hops.length < 3 || hops.some((h) => !/^[0-9A-F]{40}$/i.test(h.fp))) continue;
+      circuits.push({ id: m[1], hops, created: (m[3].match(/TIME_CREATED=(\S+)/) || [])[1] || '' });
+    }
+    if (!circuits.length) return null;
+
+    const fps = [...new Set(circuits.flatMap((c) => c.hops.map((h) => h.fp)))];
+    const ipByFp = {};
+    let current = null;
+    for (const line of (await this.control(fps.map((fp) => `GETINFO ns/id/${fp}`))).split(/\r?\n/)) {
+      const head = line.match(/ns\/id\/([0-9A-F]{40})=/i);
+      if (head) { current = head[1].toUpperCase(); continue; }
+      if (current && line.startsWith('r ')) {
+        const ip = line.split(' ').find((t) => /^\d{1,3}(\.\d{1,3}){3}$/.test(t));
+        if (ip) ipByFp[current] = ip;
+        current = null;
+      }
+    }
+
+    const ips = [...new Set(Object.values(ipByFp))];
+    const countryByIp = {};
+    if (ips.length) {
+      const out = await this.control(ips.map((ip) => `GETINFO ip-to-country/${ip}`)).catch(() => '');
+      for (const m of out.matchAll(/ip-to-country\/([\d.]+)=(\w+)/g)) {
+        if (m[2] !== '??') countryByIp[m[1]] = m[2].toUpperCase();
+      }
+    }
+
+    const withIps = circuits.map((c) => ({
+      ...c,
+      hops: c.hops.map((h) => {
+        const ip = ipByFp[h.fp.toUpperCase()] || null;
+        return { nickname: h.nickname, ip, country: (ip && countryByIp[ip]) || null };
+      }),
+    }));
+    const used = withIps.find((c) => c.id === this.lastCircuitId);
+    const byIp = exitIpHint && withIps.find((c) => c.hops[c.hops.length - 1].ip === exitIpHint);
+    const chosen = used || byIp || withIps.sort((a, b) => (a.created < b.created ? 1 : -1))[0];
+    return { exact: !!(used || byIp), hops: chosen.hops };
   }
 
   // Просит Tor построить новые цепочки — следующий запрос пойдёт с другого IP.

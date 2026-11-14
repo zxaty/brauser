@@ -65,12 +65,129 @@ function renderChip() {
   }
   chip.textContent = text;
   chip.className = cls;
-  chip.title = settings.mode === 'tor' && tor.message ? tor.message : 'Текущий маршрут';
+  chip.title = settings.mode === 'tor' && tor.message ? tor.message : 'Показать маршрут';
+}
+
+// ------------------------------------------------------------ схема маршрута
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const ICONS = {
+  you: 'M3 5h18v11H3z M8 20h8 M12 16v4',
+  tor: 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18z M12 7a5 5 0 1 0 0 10a5 5 0 0 0 0-10z M12 10.5a1.5 1.5 0 1 0 0 3a1.5 1.5 0 0 0 0-3z',
+  proxy: 'M4 5h16v6H4z M4 13h16v6H4z M7 8h.01 M7 16h.01',
+  site: 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18z M3 12h18 M12 3c3 3 3 15 0 18 M12 3c-3 3-3 15 0 18',
+};
+
+function icon(name) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('class', 'icon');
+  const path = document.createElementNS(SVG_NS, 'path');
+  path.setAttribute('d', ICONS[name]);
+  svg.append(path);
+  return svg;
+}
+
+const regionNames = new Intl.DisplayNames(['ru'], { type: 'region' });
+function countryName(code) {
+  if (!code) return '';
+  try { return regionNames.of(code); } catch { return code; }
+}
+
+function routeNode({ kind, iconName, role, main, sub, extra, progress }) {
+  const node = el('div', 'node ' + kind);
+  const head = el('div', 'head');
+  head.append(icon(iconName), el('span', 'role', role));
+  node.append(head, el('div', 'main', main));
+  if (sub) node.append(el('div', 'sub', sub));
+  if (extra) node.append(el('div', 'extra', extra));
+  if (progress !== undefined) {
+    const bar = el('div', 'bar');
+    const fill = el('span');
+    fill.style.width = progress + '%';
+    bar.append(fill);
+    node.append(bar);
+  }
+  return node;
+}
+
+function renderRoute() {
+  const { settings, tor, route, identity } = state;
+  const flow = $('routeflow');
+  flow.replaceChildren();
+  if (!route) return;
+
+  const nodes = [];
+  let linkClass = 'secure';
+  let note = '';
+  const real = route.real;
+
+  nodes.push({
+    kind: 'you', iconName: 'you', role: 'Вы',
+    main: real ? real.ip : 'ваш IP',
+    sub: real ? countryName(real.country) : (settings.checkIp ? 'определяется…' : 'показ IP выключен'),
+  });
+
+  const exitNode = (label) => ({
+    kind: 'site', iconName: 'site', role: label,
+    main: route.exit ? route.exit.ip : '—',
+    sub: route.exit ? countryName(route.exit.country) : 'IP пока неизвестен',
+    extra: identity ? 'пояс: ' + identity.timezone : '',
+  });
+
+  if (settings.mode === 'tor') {
+    if (tor.status !== 'ready') {
+      const failed = tor.status === 'missing' || tor.status === 'error' || tor.status === 'stopped';
+      nodes.push({
+        kind: 'tor' + (failed ? ' failed' : ''), iconName: 'tor', role: 'Сеть Tor',
+        main: failed ? 'нет соединения' : `подключение ${tor.progress}%`,
+        sub: tor.message,
+        progress: failed ? undefined : tor.progress,
+      });
+      nodes.push({ kind: 'site off', iconName: 'site', role: 'Сайт видит', main: '—', sub: 'трафик заблокирован' });
+      linkClass = 'idle';
+      note = 'Пока Tor не подключён, браузер не выпускает трафик наружу — напрямую он не пойдёт.';
+    } else {
+      const hops = route.circuit ? route.circuit.hops : null;
+      if (hops) {
+        const roles = ['Входной узел', 'Промежуточный узел', 'Выходной узел'];
+        hops.slice(-3).forEach((hop, i) => nodes.push({
+          kind: 'tor', iconName: 'tor', role: roles[i],
+          main: hop.ip || 'скрыт',
+          sub: countryName(hop.country),
+          extra: hop.nickname,
+        }));
+      } else {
+        nodes.push({ kind: 'tor', iconName: 'tor', role: 'Сеть Tor', main: '3 узла', sub: 'цепочка строится…' });
+      }
+      nodes.push(exitNode('Сайт видит'));
+      note = 'Входной узел знает ваш IP, но не знает, куда вы идёте. Выходной видит сайт, но не знает, кто вы. Сайт видит только выходной узел.';
+    }
+  } else if (settings.mode === 'proxy' && route.proxy) {
+    nodes.push({
+      kind: 'proxy', iconName: 'proxy', role: 'Прокси',
+      main: route.proxy.host + ':' + route.proxy.port,
+      sub: route.proxy.scheme.toUpperCase(),
+    });
+    nodes.push(exitNode('Сайт видит'));
+    note = 'Сайт видит адрес прокси. Сам прокси видит и ваш IP, и адреса сайтов — используйте только те, которым доверяете.';
+  } else {
+    nodes.push({ ...exitNode('Сайт видит'), kind: 'site exposed', extra: 'ваш настоящий IP' });
+    linkClass = 'warn';
+    note = 'Прямое соединение: сайты видят ваш настоящий IP. Скрыт только отпечаток браузера. Включите Tor или прокси ниже.';
+  }
+
+  nodes.forEach((n, i) => {
+    if (i) flow.append(el('div', 'link ' + linkClass));
+    flow.append(routeNode(n));
+  });
+  $('routenote').textContent = note;
 }
 
 // ------------------------------------------------------------ настройки
 
 function renderPanelLive() {
+  renderRoute();
   const { tor, identity, settings, proxyCount } = state;
   const status = $('torstatus');
   const labels = {
@@ -163,6 +280,7 @@ $('reload').addEventListener('click', () => api.call('nav:reload'));
 $('rotate').addEventListener('click', () => api.call('ip:rotate'));
 $('ident').addEventListener('click', () => { setPanel(false); api.call('identity:new'); });
 $('gear').addEventListener('click', () => setPanel(!panelOpen));
+$('chip').addEventListener('click', () => setPanel(!panelOpen));
 $('closepanel').addEventListener('click', () => setPanel(false));
 $('apply').addEventListener('click', applySettings);
 $('addrform').addEventListener('submit', (e) => {
