@@ -174,5 +174,55 @@ if (!WIN) {
   });
 }
 
+// ---------------------------------------------------------------- подпись обновлений
+
+const crypto = require('node:crypto');
+const { verifyManifest, compareVersions } = require('../src/updater');
+{
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  const pub = publicKey.export({ type: 'spki', format: 'pem' });
+  const make = (obj, key = privateKey) => { const bytes = Buffer.from(JSON.stringify(obj)); return [bytes, crypto.sign(null, bytes, key).toString('base64')]; };
+  const good = { name: 'brauser', version: '9.9.9', files: { win32: { name: 'Brauser-Setup-9.9.9.exe', size: 10, sha256: 'a'.repeat(64) }, linux: { name: 'brauser_9.9.9_amd64.deb', size: 10, sha256: 'b'.repeat(64) } } };
+
+  check('манифест с верной подписью принимается', () => {
+    const [bytes, sig] = make(good);
+    assert.strictEqual(verifyManifest(bytes, sig, pub, 'linux').file.name, 'brauser_9.9.9_amd64.deb');
+    assert.strictEqual(verifyManifest(bytes, sig, pub, 'win32').version, '9.9.9');
+  });
+
+  check('изменённый манифест, чужая или пустая подпись отвергаются', () => {
+    const [bytes, sig] = make(good);
+    const tampered = Buffer.from(bytes.toString().replace('bbbb', 'cccc'));
+    assert.throws(() => verifyManifest(tampered, sig, pub, 'linux'), /подпись/);
+    const other = crypto.generateKeyPairSync('ed25519').privateKey;
+    assert.throws(() => verifyManifest(bytes, make(good, other)[1], pub, 'linux'), /подпись/);
+    assert.throws(() => verifyManifest(bytes, '', pub, 'linux'), /подпись/);
+    assert.throws(() => verifyManifest(bytes, 'AAAA', pub, 'linux'), /подпись/);
+  });
+
+  check('подписанный, но некорректный манифест отвергается', () => {
+    for (const bad of [
+      { ...good, name: 'other' },
+      { ...good, version: '1.2' },
+      { ...good, files: { linux: { name: '../../etc/passwd', size: 10, sha256: 'b'.repeat(64) } } },
+      { ...good, files: { linux: { name: 'a.deb', size: 10, sha256: 'xyz' } } },
+      { ...good, files: { linux: { name: 'a.deb', size: -1, sha256: 'b'.repeat(64) } } },
+      { ...good, files: {} },
+    ]) assert.throws(() => verifyManifest(...make(bad), pub, 'linux'), /манифест|установщика/);
+  });
+
+  check('версии сравниваются по числам, откат не считается обновлением', () => {
+    assert.ok(compareVersions('1.10.0', '1.9.9') > 0);
+    assert.ok(compareVersions('1.2.0', '1.2.0') === 0);
+    assert.ok(compareVersions('1.1.9', '1.2.0') < 0);
+    assert.throws(() => compareVersions('1.2.0-beta', '1.2.0'));
+  });
+
+  check('в приложение зашит корректный открытый ключ Ed25519', () => {
+    const key = crypto.createPublicKey(require('../src/update-key'));
+    assert.strictEqual(key.asymmetricKeyType, 'ed25519');
+  });
+}
+
 fs.rmSync(dataDir, { recursive: true, force: true });
 console.log(`\nвсе проверки пройдены: ${passed}`);

@@ -3,7 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 const CHANNELS = new Set([
   // панель управления
-  'state:get', 'mode:set', 'browser:launch', 'basic:open', 'tor:newnym', 'tor:restart', 'settings:set', 'proxy:resolve', 'tor:newcircuit', 'bridges:builtin',
+  'state:get', 'mode:set', 'browser:launch', 'basic:open', 'tor:newnym', 'tor:restart', 'settings:set', 'proxy:resolve', 'tor:newcircuit', 'bridges:builtin', 'update:check', 'update:install', 'update:restart',
   // окно обычного браузера
   'basic:state', 'tab:new', 'tab:close', 'tab:activate', 'nav:go', 'nav:back', 'nav:forward', 'nav:reload', 'basic:to-secured',
 ]);

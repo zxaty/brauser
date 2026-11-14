@@ -16,6 +16,8 @@ const { BrowserEngine } = require('./browser');
 const { parseProxy } = require('./proxy');
 const basic = require('./basic');
 const rebrand = require('./rebrand');
+const { Updater } = require('./updater');
+const UPDATE_KEY = require('./update-key');
 
 const SELFTEST = process.argv.includes('--selftest');
 // brauser --open=https://example.org — сразу открыть адрес в защищённом браузере.
@@ -52,12 +54,15 @@ const DEFAULTS = {
   // и включается только явно, галочкой в панели.
   showRealIp: false,
   autoLaunch: true,   // открывать браузер, как только Tor подключился
+  // Проверять при запуске, не вышла ли новая версия. В Secured запрос идёт через Tor.
+  checkUpdates: true,
 };
 
 let win = null;
 let settings = { ...DEFAULTS };
 let tor = null;
 let engine = null;
+let updater = null;
 let fatal = '';
 let realIp = null;   // настоящий IP пользователя — только для начала схемы
 let circuit = null;  // { target, hops } — цепочка последнего соединения
@@ -225,9 +230,11 @@ function sendState() {
     statePending = false;
     if (!win || win.isDestroyed()) return;
     const up = parseProxy(settings.upstreamProxy);
-    if (!engine || !tor) return;
+    if (!engine || !tor || !updater) return;
     win.webContents.send('state', {
       fatal,
+      version: updater.currentVersion,
+      update: updater.state,
       blocked: !!settingsBlock,
       installing: engine.installing,
       tor: { status: tor.status, progress: tor.progress, message: tor.message, transport: tor.transport, ports: tor.transport === 'tcp' ? [tor.socksPort, tor.controlPort] : null },
@@ -305,6 +312,16 @@ function builtinBridges(kind) {
   }
   const list = builtinBridgesCache[kind];
   return Array.isArray(list) ? list.filter((l) => typeof l === 'string' && !/[\p{Cc}\p{Zl}\p{Zp}]/u.test(l)) : [];
+}
+
+// Одна автоматическая проверка обновлений за запуск: в Secured — когда Tor готов,
+// в Basic — вскоре после старта. Отключается настройкой.
+let autoChecked = false;
+function autoCheckUpdates() {
+  if (autoChecked || SELFTEST || !settings.checkUpdates) return;
+  if (settings.mode === 'secured' && tor.status !== 'ready') return;
+  autoChecked = true;
+  setTimeout(() => { updater.check(); }, 4000);
 }
 
 // Адрес, который нужно открыть в защищённом браузере, как только Tor будет готов.
@@ -452,6 +469,21 @@ function registerIpc() {
     } catch (e) { notify('Цепочка не закрыта: ' + e.message); }
     sendState();
   }));
+  // Обновление: проверка по кнопке, установка в один клик, перезапуск после установки.
+  ipcMain.handle('update:check', fromPanel(async () => {
+    const version = await updater.check();
+    if (!version && updater.state.status === 'uptodate') notify('У вас последняя версия');
+  }));
+  ipcMain.handle('update:install', fromPanel(async () => {
+    const result = await updater.install();
+    // Windows: установщик уже запущен, он закроет приложение и откроет новую версию.
+    if (result === 'restarting') app.quit();
+  }));
+  ipcMain.handle('update:restart', fromPanel(() => {
+    if (updater.state.status !== 'installed') return;
+    app.relaunch();
+    app.quit();
+  }));
   // Встроенные мосты Tor Browser для подстановки в поле мостов.
   ipcMain.handle('bridges:builtin', fromPanel((kind) => {
     if (!['obfs4', 'snowflake', 'meek'].includes(kind)) return '';
@@ -475,7 +507,7 @@ function registerIpc() {
       if (value && !parseProxy(value)) notify('Адрес прокси не распознан или содержит недопустимые символы — оставлен прежний');
       else next.upstreamProxy = value;
     }
-    for (const k of ['showRealIp', 'autoLaunch']) if (typeof patch[k] === 'boolean') next[k] = patch[k];
+    for (const k of ['showRealIp', 'autoLaunch', 'checkUpdates']) if (typeof patch[k] === 'boolean') next[k] = patch[k];
 
     // Сначала запись на диск, и только при успехе новые настройки вступают в силу:
     // работающее состояние не должно расходиться с сохранённым.
@@ -563,6 +595,16 @@ async function runSelfTest() {
     await new Promise((r) => setTimeout(r, 1200));
     const entry = recent.find((r) => r.target === site);
     result.siteCircuit = entry ? { hops: entry.hops.length, closed: await tor.control([`CLOSECIRCUIT ${entry.circuitId}`]).then(() => true, (e) => e.message) } : null;
+    if (process.argv.includes('--update')) {
+      // Проверка обновления: через Tor, с проверкой подписи. Установка — только по BRAUSER_UPDATE_INSTALL.
+      const found = await updater.check();
+      result.update = { current: updater.currentVersion, found, afterCheck: updater.state.status, message: updater.state.message };
+      if (found) {
+        result.update.install = await updater.install({ dryRun: !process.env.BRAUSER_UPDATE_INSTALL });
+        result.update.afterInstall = updater.state.status;
+        result.update.message = updater.state.message;
+      }
+    }
     result.builtinBridges = { obfs4: builtinBridges('obfs4').length, snowflake: builtinBridges('snowflake').length };
     await new Promise((r) => setTimeout(r, 1500));
     result.targets = [...new Set(targets)].slice(0, 12);
@@ -613,6 +655,20 @@ if (!app.requestSingleInstanceLock()) {
     });
     tor = new TorManager({ dataDir: path.join(userData, 'tor-data') });
     await tor.init();
+    updater = new Updater({
+      // BRAUSER_FAKE_VERSION — только для проверки обновления: подпись выпуска всё равно обязательна.
+      currentVersion: process.env.BRAUSER_FAKE_VERSION || app.getVersion(),
+      publicKey: UPDATE_KEY,
+      workDir: path.join(userData, 'update'),
+      // В Secured — только через Tor; пока он не готов (или запуск заблокирован), обновления не запрашиваются.
+      getSocks: () => {
+        if (settings.mode !== 'secured') return null;
+        if (settingsBlock || tor.status !== 'ready') throw new Error('Tor ещё не подключён');
+        const c = tor.connection;
+        return c.socksPath ? { socksPath: c.socksPath } : { socksPort: c.socksPort };
+      },
+    });
+    updater.on('change', sendState);
     basic.setOpenInSecured(openInSecured);
     if (!REPORT_SETTINGS) migrateOldSecrets(tor.dataDir); // отчёт о настройках ничего на диске не меняет
 
@@ -621,6 +677,7 @@ if (!app.requestSingleInstanceLock()) {
       const ready = tor.status === 'ready';
       if (ready && !wasReady) {
         probeRealIp();
+        autoCheckUpdates();
         if (settings.mode === 'secured') {
           const url = pendingOpen;
           pendingOpen = undefined;
@@ -654,6 +711,7 @@ if (!app.requestSingleInstanceLock()) {
     registerIpc();
     createWindow();
     probeRealIp();
+    autoCheckUpdates();
     const started = settings.mode === 'secured' ? boot() : Promise.resolve();
     if (SELFTEST) { await started; runSelfTest().catch((e) => { console.log('SELFTEST FAILED ' + (e && e.stack || e)); app.quit(); }); }
   });

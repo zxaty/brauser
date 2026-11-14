@@ -171,6 +171,7 @@ function renderTop() {
   $('view-basic').hidden = secured;
   $('fatal').hidden = !fatal;
   $('fatal').textContent = fatal;
+  renderUpdate();
   $('blockcard').hidden = !state.blocked;
   $('apply').disabled = state.blocked; // обычные настройки не применяются, пока не решён вопрос с прокси
   $('restart').disabled = state.blocked;
@@ -194,6 +195,30 @@ function renderTop() {
   $('newnym').disabled = tor.status !== 'ready';
 }
 
+// Полоса обновления: что найдено и что с этим можно сделать одной кнопкой.
+let updateAction = null;
+function renderUpdate() {
+  const u = state.update;
+  const bar = $('updatebar');
+  const button = $('update-go');
+  $('version').textContent = state.version;
+  const views = {
+    available: [`Доступна версия ${u.version} (у вас ${state.version})` + (u.message ? ' — ' + u.message : ''), 'Обновить', 'update:install'],
+    downloading: [`Скачивание обновления: ${u.progress}%`, '', null],
+    installing: ['Установка обновления… Если система спросит пароль — это установка пакета.', '', null],
+    installed: ['Обновление установлено. Новая версия заработает после перезапуска.', 'Перезапустить', 'update:restart'],
+    error: [u.message, 'Проверить снова', 'update:check'],
+  };
+  const view = views[u.status];
+  bar.hidden = !view;
+  if (!view) return;
+  bar.className = 'updatebar' + (u.status === 'error' ? ' error' : '');
+  $('updatetext').textContent = view[0];
+  button.hidden = !view[2];
+  button.textContent = view[1];
+  updateAction = view[2];
+}
+
 const EXIT_COUNTRIES = ['de', 'nl', 'fr', 'ch', 'se', 'no', 'fi', 'at', 'pl', 'cz', 'ro', 'gb', 'us', 'ca', 'jp', 'sg'];
 
 function fillForm() {
@@ -206,6 +231,7 @@ function fillForm() {
   $('bridges').value = s.bridges;
   $('checkip').checked = s.showRealIp;
   $('autolaunch').checked = s.autoLaunch;
+  $('checkupdates').checked = s.checkUpdates;
   formFilled = true;
 }
 
@@ -216,6 +242,7 @@ async function applySettings() {
     bridges: $('bridges').value,
     showRealIp: $('checkip').checked,
     autoLaunch: $('autolaunch').checked,
+    checkUpdates: $('checkupdates').checked,
   });
   formFilled = false;
 }
@@ -238,6 +265,8 @@ $('open-basic').addEventListener('click', () => api.call('basic:open'));
 $('newnym').addEventListener('click', () => api.call('tor:newnym'));
 $('restart').addEventListener('click', () => api.call('tor:restart'));
 $('apply').addEventListener('click', applySettings);
+$('update-go').addEventListener('click', () => { if (updateAction) api.call(updateAction); });
+$('update-check').addEventListener('click', () => api.call('update:check'));
 for (const kind of ['obfs4', 'snowflake']) {
   $('builtin-' + kind).addEventListener('click', async () => {
     const lines = await api.call('bridges:builtin', kind);
