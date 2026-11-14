@@ -5,6 +5,7 @@
 # В vendor/ должен лежать архив Tor Browser, закреплённый в src/bundles.js (см. README).
 set -e
 
+sh scripts/verify-signature.sh
 node scripts/verify-vendor.js linux
 npm install --no-audit --no-fund
 npx electron-builder --linux deb --x64
