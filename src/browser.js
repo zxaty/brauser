@@ -71,9 +71,12 @@ class BrowserEngine extends EventEmitter {
     if (!found) throw new Error('В поставке нет архива Tor Browser');
     this.installing = true;
     this.emit('change');
-    // Windows: проверенные байты установщика кладутся в папку данных пользователя
-    // и запускаются оттуда — файл из поставки после проверки больше не читается.
-    const setup = path.join(path.dirname(this.root), `tor-browser-setup-${process.pid}.exe`);
+    // Windows: проверенные байты установщика кладутся в новый каталог со случайным
+    // именем внутри папки данных пользователя и запускаются оттуда — файл из
+    // поставки после проверки больше не читается, а имя нельзя угадать заранее.
+    // От процесса с правами того же пользователя это не защищает: он и так
+    // может изменить уже установленный движок.
+    let setupDir = null;
     try {
       const data = await this._readVerifiedBundle(found);
       fs.rmSync(this.root, { recursive: true, force: true });
@@ -81,7 +84,13 @@ class BrowserEngine extends EventEmitter {
       await new Promise((resolve, reject) => {
         let p;
         if (WIN) {
-          fs.writeFileSync(setup, data, { mode: 0o700 });
+          setupDir = fs.mkdtempSync(path.join(path.dirname(this.root), 'setup-'));
+          const setup = path.join(setupDir, 'tor-browser-setup.exe');
+          fs.writeFileSync(setup, data, { mode: 0o700, flag: 'wx' }); // только новый файл
+          // Перечитываем записанное: запускаться должен ровно проверенный образ.
+          if (crypto.createHash('sha256').update(fs.readFileSync(setup)).digest('hex') !== found.sha256) {
+            throw new Error('временный файл установщика изменён до запуска');
+          }
           // «Портативный» установщик Tor Browser: тихий режим, папка через /D=
           // (по правилам NSIS этот ключ идёт последним и без кавычек).
           p = spawn(setup, ['/S', `/D=${this.root}`], { windowsHide: true, stdio: 'ignore', windowsVerbatimArguments: true });
@@ -96,7 +105,7 @@ class BrowserEngine extends EventEmitter {
       });
       if (!this.installed) throw new Error('после распаковки не найден Tor Browser в ' + this.root);
     } finally {
-      try { fs.rmSync(setup, { force: true }); } catch { /* не критично */ }
+      if (setupDir) { try { fs.rmSync(setupDir, { recursive: true, force: true }); } catch { /* не критично */ } }
       this.installing = false;
       this.emit('change');
     }
@@ -136,11 +145,51 @@ class BrowserEngine extends EventEmitter {
     });
     const startedAt = Date.now();
     proc.on('exit', (code) => {
-      this.lastExit = { code, afterMs: Date.now() - startedAt };
-      if (this.proc === proc) this.proc = null;
-      this.emit('change');
+      const afterMs = Date.now() - startedAt;
+      this.lastExit = { code, afterMs };
+      if (this.proc !== proc) return; // остановлен нами
+      // Движок иногда сам перезапускается сразу после старта: исходный процесс
+      // завершается, а браузер продолжает работать в новом. Поэтому «закрыт»
+      // определяем не по одному процессу, а по тому, жив ли движок вообще.
+      this._followRestart(proc, { quickExit: afterMs < 20_000 });
     });
     this.emit('change');
+  }
+
+  // Работает ли сейчас хоть один процесс движка, запущенный из нашей установки.
+  _alive(proc) {
+    if (WIN) {
+      // Работающий Firefox держит файл блокировки профиля открытым монопольно.
+      const lock = path.join(this.paths.browserDir, 'TorBrowser', 'Data', 'Browser', 'profile.default', 'parent.lock');
+      try { fs.closeSync(fs.openSync(lock, 'r+')); return false; } catch (e) { return e.code !== 'ENOENT'; }
+    }
+    // Linux: браузер запущен отдельной группой процессов; сигнал 0 проверяет, остался ли в ней кто-то.
+    try { process.kill(-proc.pid, 0); return true; } catch { return false; }
+  }
+
+  _followRestart(proc, { quickExit }) {
+    // Новому процессу нужно время, чтобы занять профиль; ждём дольше, если
+    // исходный завершился подозрительно быстро.
+    let checksLeft = quickExit ? 16 : 3;
+    let adopted = false;
+    const tick = () => {
+      if (this.proc !== proc) return; // остановлен нами
+      if (this._alive(proc)) {
+        if (!adopted) {
+          adopted = true;
+          proc.adopted = true;
+          this.emit('change');
+        }
+        checksLeft = 2; // после перезапуска «закрыт» — это два пустых замера подряд
+        setTimeout(tick, 2000);
+      } else if (--checksLeft > 0) {
+        setTimeout(tick, 500);
+      } else {
+        this.proc = null;
+        this.emit('change');
+      }
+    };
+    tick();
   }
 
   stop() {
@@ -148,8 +197,23 @@ class BrowserEngine extends EventEmitter {
     this.proc = null;
     if (!proc || !proc.pid) return;
     try {
-      if (WIN) spawnSync('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-      else process.kill(-proc.pid, 'SIGTERM'); // вся группа процессов браузера
+      if (!WIN) { process.kill(-proc.pid, 'SIGTERM'); return; } // вся группа процессов; Firefox по SIGTERM выходит штатно
+      // Windows: сначала просим закрыться по-хорошему (как при нажатии на крестик):
+      // принудительное завершение Firefox засчитывает как аварию и может испортить профиль.
+      // После самоперезапуска номера процессов неизвестны — ищем их по точному пути
+      // к исполняемому файлу, чтобы не задеть другой Firefox.
+      const exe = this.paths.exe.replace(/'/g, "''");
+      const ours = `Get-CimInstance Win32_Process -Filter "Name='firefox.exe'" | Where-Object { $_.ExecutablePath -eq '${exe}' }`;
+      const ps = (command, timeout) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], { windowsHide: true, stdio: 'ignore', timeout });
+      if (proc.adopted) ps(`(${ours}) | ForEach-Object { $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; if ($p) { [void]$p.CloseMainWindow() } }`, 15_000);
+      else spawnSync('taskkill', ['/pid', String(proc.pid), '/T'], { windowsHide: true, stdio: 'ignore' });
+      // Ждём до шести секунд, пока движок освободит профиль.
+      const until = Date.now() + 6000;
+      while (Date.now() < until && this._alive(proc)) spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},250)'], { stdio: 'ignore', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } });
+      if (!this._alive(proc)) return;
+      // Не закрылся сам — завершаем принудительно.
+      spawnSync('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      if (this._alive(proc)) ps(`(${ours}) | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`, 20_000);
     } catch { /* уже завершён */ }
   }
 }

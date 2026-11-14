@@ -94,7 +94,7 @@ function installStartPage(root, browserDir, startPage) {
   // В user.js меняется только наша строка: остальные настройки, которые там
   // мог оставить пользователь (в том числе настройки защиты), сохраняются.
   const file = path.join(profile, 'user.js');
-  const MARK = '// brauser: стартовая страница';
+  const MARK = '// brauser:'; // так помечены все строки, которые добавляет Brauser
   let kept = [];
   try {
     kept = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter((line) => line.trim()
@@ -102,7 +102,15 @@ function installStartPage(root, browserDir, startPage) {
       && !line.startsWith('// Создано Brauser')
       && !/^\s*user_pref\(\s*"browser\.startup\.homepage"\s*,/.test(line));
   } catch { /* файла ещё нет */ }
-  fs.writeFileSync(file, [...kept, `user_pref("browser.startup.homepage", ${JSON.stringify(url)}); ${MARK}`, ''].join('\n'));
+  fs.writeFileSync(file, [
+    ...kept,
+    `user_pref("browser.startup.homepage", ${JSON.stringify(url)}); ${MARK} стартовая страница`,
+    // Панель может закрыть движок, пока тот ещё запускается. Firefox считает это
+    // аварией при старте и после нескольких раз открывает вместо браузера диалог
+    // безопасного режима — отключаем этот счётчик.
+    `user_pref("toolkit.startup.max_resumed_crashes", -1); ${MARK} без диалога безопасного режима`,
+    '',
+  ].join('\n'));
 }
 
 // Поиск из адресной строки: тот же DuckDuckGo, но с параметрами оформления и под
