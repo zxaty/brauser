@@ -1,7 +1,7 @@
 {
   "name": "brauser",
   "productName": "Brauser",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Brauser: панель управления и движок Tor Browser (Secured) плюс обычный быстрый браузер (Basic)",
   "author": {
     "name": "Brauser",
@@ -12,9 +12,10 @@
   "scripts": {
     "start": "electron .",
     "selftest": "electron . --selftest",
-    "dist": "electron-builder --win nsis --x64",
+    "dist": "node scripts/verify-vendor.js win32 && electron-builder --win nsis --x64",
     "dist:linux": "sh scripts/build-linux.sh",
-    "dist:linux:docker": "pwsh -NoProfile -File scripts/build-linux.ps1"
+    "dist:linux:docker": "pwsh -NoProfile -File scripts/build-linux.ps1",
+    "test:security": "node scripts/test-security.js"
   },
   "build": {
     "appId": "local.brauser.app",
