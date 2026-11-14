@@ -2,7 +2,21 @@
 
 Приватный браузер на Electron (движок Chromium): подмена отпечатка, встроенный Tor и ротация прокси.
 
-## Запуск
+## Установка
+
+**Linux Mint / Ubuntu / Debian** — одна команда в терминале:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/zxaty/brauser/main/install.sh | sh
+```
+
+Потом запуск командой `brauser` или из меню приложений. Удаление: `sudo apt remove brauser`.
+
+**Windows** — скачайте установщик со страницы [Releases](https://github.com/zxaty/brauser/releases/latest) и запустите. SmartScreen предупредит о неподписанном файле: «Подробнее» → «Выполнить в любом случае».
+
+Tor уже внутри обеих сборок. Чтобы включить: шестерёнка → режим «Tor» → «Применить».
+
+## Запуск из исходников
 
 ```bash
 npm install
