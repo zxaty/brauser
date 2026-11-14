@@ -1,8 +1,8 @@
 {
   "name": "brauser",
   "productName": "Brauser",
-  "version": "0.2.0",
-  "description": "Приватный браузер: подмена отпечатка, Tor и ротация прокси",
+  "version": "1.0.0",
+  "description": "Brauser: панель управления и движок Tor Browser (Secured) плюс обычный быстрый браузер (Basic)",
   "author": {
     "name": "Brauser",
     "email": "brauser@localhost"
@@ -12,7 +12,6 @@
   "scripts": {
     "start": "electron .",
     "selftest": "electron . --selftest",
-    "selftest:tor": "electron . --selftest --tor",
     "dist": "electron-builder --win nsis --x64",
     "dist:linux": "sh scripts/build-linux.sh",
     "dist:linux:docker": "pwsh -NoProfile -File scripts/build-linux.ps1"
@@ -31,8 +30,11 @@
       "target": "nsis",
       "extraResources": [
         {
-          "from": "tor",
-          "to": "tor"
+          "from": "vendor",
+          "to": "tor-browser-bundle",
+          "filter": [
+            "tor-browser-windows-x86_64-portable-*.exe"
+          ]
         }
       ]
     },
@@ -46,12 +48,15 @@
       "target": "deb",
       "category": "Network",
       "executableName": "brauser",
-      "synopsis": "Приватный браузер с Tor и подменой отпечатка",
+      "synopsis": "Панель управления Tor и движок Tor Browser",
       "artifactName": "brauser_${version}_${arch}.${ext}",
       "extraResources": [
         {
-          "from": "tor-linux",
-          "to": "tor"
+          "from": "vendor",
+          "to": "tor-browser-bundle",
+          "filter": [
+            "tor-browser-linux-x86_64-*.tar.xz"
+          ]
         }
       ]
     },
@@ -67,7 +72,11 @@
         "libuuid1",
         "libsecret-1-0",
         "libasound2t64 | libasound2",
-        "libgbm1"
+        "libgbm1",
+        "xz-utils",
+        "libdbus-glib-1-2",
+        "libxt6t64 | libxt6",
+        "libx11-xcb1"
       ]
     }
   },

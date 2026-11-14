@@ -2,9 +2,10 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 const CHANNELS = new Set([
-  'state:get', 'tab:new', 'tab:close', 'tab:activate',
-  'nav:go', 'nav:back', 'nav:forward', 'nav:reload',
-  'identity:new', 'ip:rotate', 'panel:set', 'settings:set',
+  // панель управления
+  'state:get', 'mode:set', 'browser:launch', 'basic:open', 'tor:newnym', 'tor:restart', 'settings:set',
+  // окно обычного браузера
+  'basic:state', 'tab:new', 'tab:close', 'tab:activate', 'nav:go', 'nav:back', 'nav:forward', 'nav:reload',
 ]);
 
 contextBridge.exposeInMainWorld('api', {
@@ -13,6 +14,7 @@ contextBridge.exposeInMainWorld('api', {
     return ipcRenderer.invoke(channel, arg);
   },
   onState: (cb) => ipcRenderer.on('state', (_e, state) => cb(state)),
+  onBasicState: (cb) => ipcRenderer.on('basic-state', (_e, state) => cb(state)),
   onNotice: (cb) => ipcRenderer.on('notice', (_e, text) => cb(text)),
   onFocusAddress: (cb) => ipcRenderer.on('focus-address', () => cb()),
 });

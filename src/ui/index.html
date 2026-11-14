@@ -6,79 +6,80 @@
   <title>Brauser</title>
   <link rel="stylesheet" href="ui.css">
 </head>
-<body>
-  <header>
-    <div id="tabstrip">
-      <div id="tabs"></div>
-      <button id="newtab" title="Новая вкладка (Ctrl+T)">+</button>
+<body class="panel">
+  <div class="wrap">
+    <div class="top">
+      <span class="brand">Brauser</span>
+      <div class="modes">
+        <button id="mode-secured" class="secured" title="Движок Tor Browser через сеть Tor">Secured</button>
+        <button id="mode-basic" class="basic" title="Обычный быстрый браузер без Tor">Basic</button>
+      </div>
+      <span id="pill" class="pill"></span>
     </div>
-    <div id="nav">
-      <button id="back" title="Назад">←</button>
-      <button id="forward" title="Вперёд">→</button>
-      <button id="reload" title="Обновить (Ctrl+R)">⟳</button>
-      <form id="addrform"><input id="addr" type="text" spellcheck="false" autocomplete="off" placeholder="Адрес или поисковый запрос"></form>
-      <span id="chip" title="Показать маршрут"></span>
-      <button id="rotate" class="wide" title="Сменить маршрут, вкладки остаются (Ctrl+Shift+I)">Сменить IP</button>
-      <button id="ident" class="wide accent" title="Новый IP, новый отпечаток, куки и вкладки стираются (Ctrl+Shift+N)">Новая личность</button>
-      <button id="gear" title="Настройки">⚙</button>
-    </div>
-  </header>
 
-  <main id="panel" hidden>
-    <section id="route">
-      <h2>Маршрут</h2>
-      <div id="routeflow" class="flow"></div>
-      <p id="routenote" class="hint"></p>
-    </section>
+    <div id="fatal" class="fatal" hidden></div>
 
-    <div class="cols">
-      <section>
-        <h2>Сеть</h2>
-        <label class="radio"><input type="radio" name="mode" value="direct"> Напрямую <small>реальный IP, только подмена отпечатка</small></label>
-        <label class="radio"><input type="radio" name="mode" value="tor"> Tor <small>встроенный, новая цепочка по кнопке</small></label>
-        <label class="radio"><input type="radio" name="mode" value="proxy"> Свои прокси <small>ротация по списку</small></label>
+    <!-- ================= Secured ================= -->
+    <div id="view-secured">
+      <div class="hero">
+        <button id="open-secured" class="big tor">Открыть защищённый браузер</button>
+        <button id="newnym" class="wide" title="Построить новые цепочки: следующие соединения пойдут с других IP">Новая цепочка</button>
+        <p>Страницы открывает движок Tor Browser без изменений: у вас тот же отпечаток, что у миллионов его пользователей, и своя цепочка на каждый сайт.</p>
+      </div>
 
-        <h3>Tor</h3>
-        <p id="torstatus" class="status"></p>
-        <label>Путь к tor.exe <small>пусто — искать в папке tor/ рядом с проектом</small>
-          <input id="torpath" type="text" spellcheck="false">
-        </label>
-        <label>Мосты <small>по одному в строке; нужны, если Tor заблокирован провайдером</small>
-          <textarea id="bridges" rows="3" spellcheck="false" placeholder="obfs4 1.2.3.4:443 FINGERPRINT cert=… iat-mode=0"></textarea>
-        </label>
+      <div class="card">
+        <h2>Маршрут</h2>
+        <div id="routeflow" class="flow"></div>
+        <p id="routenote" class="hint"></p>
+      </div>
 
-        <h3>Прокси</h3>
-        <label>Список <small>по одному в строке: socks5://host:port, http://user:pass@host:port</small>
-          <textarea id="proxies" rows="5" spellcheck="false" placeholder="socks5://127.0.0.1:1080"></textarea>
-        </label>
-        <label>Автосмена IP каждые <input id="rotatemin" type="number" min="0" max="1440" step="1"> мин <small>0 — выключено</small></label>
-      </section>
+      <div class="card" id="recentcard" hidden>
+        <h3>Последние соединения</h3>
+        <div id="recent" class="recent"></div>
+        <p class="hint">У каждого сайта своя цепочка и свой выходной IP. Список хранится только в памяти.</p>
+      </div>
 
-      <section>
-        <h2>Защита</h2>
-        <label class="check"><input id="spoof" type="checkbox"> Подменять отпечаток браузера</label>
-        <label class="check"><input id="block" type="checkbox"> Блокировать трекеры и рекламные сети</label>
-        <label class="check"><input id="checkip" type="checkbox"> Показывать IP на схеме <small>запросы к ipwho.is: через текущий маршрут и один раз напрямую, чтобы узнать ваш IP</small></label>
-        <label>Часовой пояс
-          <select id="tz">
-            <option value="auto">Авто — по выходному IP</option>
-            <option value="utc">Всегда UTC</option>
-            <option value="system">Не менять</option>
-          </select>
-        </label>
-
-        <h3>Текущая личность</h3>
-        <dl id="persona"></dl>
-
+      <div class="card">
+        <h2>Настройки Tor</h2>
+        <div class="cols">
+          <div>
+            <label>Страна выхода <small>любая — безопаснее всего: фиксированная страна сужает выбор узлов</small>
+              <select id="exit"></select>
+            </label>
+            <label>Прокси перед Tor <small>провайдер увидит соединение с прокси, а не с Tor: socks5://host:port или http://user:pass@host:port</small>
+              <input id="upstream" type="text" spellcheck="false" placeholder="не используется">
+            </label>
+            <label class="check"><input id="checkip" type="checkbox"> Показывать мой IP на схеме <small>один прямой запрос к ipwho.is</small></label>
+            <label class="check"><input id="autolaunch" type="checkbox"> Открывать браузер сразу после подключения</label>
+          </div>
+          <div>
+            <label>Мосты <small>по одному в строке; нужны, если Tor заблокирован провайдером (bridges.torproject.org)</small>
+              <textarea id="bridges" rows="6" spellcheck="false" placeholder="obfs4 1.2.3.4:443 FINGERPRINT cert=… iat-mode=0"></textarea>
+            </label>
+          </div>
+        </div>
         <div class="actions">
           <button id="apply" class="wide accent">Применить</button>
-          <button id="closepanel" class="wide">Закрыть</button>
+          <button id="restart" class="wide">Перезапустить Tor</button>
         </div>
-        <p class="hint">Смена режима сети, прокси или защиты создаёт новую личность: вкладки закрываются, куки стираются.</p>
-      </section>
+      </div>
     </div>
+
+    <!-- ================= Basic ================= -->
+    <div id="view-basic" hidden>
+      <div class="hero">
+        <button id="open-basic" class="big accent">Открыть обычный браузер</button>
+        <p>Быстрый браузер с вкладками, без Tor и без задержек. Блокирует трекеры и рекламные сети, но сайты видят ваш настоящий IP.</p>
+      </div>
+      <div class="card">
+        <h2>Маршрут</h2>
+        <div id="basicflow" class="flow"></div>
+        <p class="hint">Прямое соединение: вход на сайты сохраняется между запусками, анонимности нет. Для чувствительных дел переключитесь на Secured.</p>
+      </div>
+    </div>
+
     <p class="credits">Brauser · Barathrum Co. · pulpadulpa</p>
-  </main>
+  </div>
 
   <div id="toast" hidden></div>
   <script src="ui.js"></script>

@@ -1,7 +1,5 @@
 node_modules/
 dist/
 
-# Бинарники Tor в репозиторий не кладём — см. раздел «Tor» в README
-tor/
-tor-linux/
-vendor/*.tar.gz
+# Архивы Tor Browser в репозиторий не кладём — см. раздел «Сборка» в README
+vendor/*

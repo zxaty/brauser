@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'">
+  <title>Brauser — Basic</title>
+  <link rel="stylesheet" href="ui.css">
+</head>
+<body class="browser">
+  <header class="chrome">
+    <div id="tabstrip">
+      <div id="tabs"></div>
+      <button id="newtab" title="Новая вкладка (Ctrl+T)">+</button>
+    </div>
+    <div id="nav">
+      <button id="back" title="Назад">←</button>
+      <button id="forward" title="Вперёд">→</button>
+      <button id="reload" title="Обновить (Ctrl+R)">⟳</button>
+      <form id="addrform"><input id="addr" type="text" spellcheck="false" autocomplete="off" placeholder="Адрес или поисковый запрос"></form>
+      <span id="chip" title="Режим Basic: прямое соединение, сайты видят ваш настоящий IP"></span>
+    </div>
+  </header>
+  <script src="basic-ui.js"></script>
+</body>
+</html>

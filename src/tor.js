@@ -1,13 +1,14 @@
 'use strict';
-// Запуск и управление собственным процессом Tor.
-// Браузер не использует системный Tor: он поднимает свой экземпляр на
-// отдельных портах и общается с ним через control-порт.
+// Запуск и управление процессом Tor. Бинарник берётся из установленного
+// Tor Browser; движок браузера подключается к этому же процессу, а панель
+// управляет им через control-порт (смена цепочек, схема маршрута, мосты).
 
 const { EventEmitter } = require('node:events');
 const { spawn } = require('node:child_process');
 const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
+const { parseProxy } = require('./proxy');
 
 const SOCKS_PORT = 9250;
 const CONTROL_PORT = 9251;
@@ -15,20 +16,19 @@ const CONTROL_PORT = 9251;
 const fwd = (p) => p.replace(/\\/g, '/');
 
 class TorManager extends EventEmitter {
-  constructor({ dataDir, appDir }) {
+  constructor({ dataDir }) {
     super();
     this.dataDir = dataDir;
-    this.appDir = appDir;
     this.proc = null;
-    this.status = 'stopped'; // stopped | missing | starting | ready | error
+    this.status = 'stopped'; // stopped | starting | ready | error
     this.progress = 0;
     this.message = '';
     this.lastNewnym = 0;
-    this.events = null;       // постоянное соединение с control-портом для событий
-    this.lastCircuitId = null; // цепочка, по которой ушло последнее соединение
+    this.events = null;          // постоянное соединение с control-портом для событий
+    this.relayCache = new Map(); // отпечаток узла -> { ip, country }
   }
 
-  get socksRules() { return `socks5://127.0.0.1:${SOCKS_PORT}`; }
+  get cookieFile() { return path.join(this.dataDir, 'control_auth_cookie'); }
 
   _set(status, message = '', progress = this.progress) {
     this.status = status;
@@ -37,87 +37,62 @@ class TorManager extends EventEmitter {
     this.emit('change');
   }
 
-  findBinary(custom) {
-    const exe = process.platform === 'win32' ? 'tor.exe' : 'tor';
-    const candidates = [
-      custom,
-      path.join(this.appDir, process.platform === 'linux' ? 'tor-linux' : 'tor', 'tor', exe),
-      path.join(this.appDir, 'tor', 'tor', exe),
-      path.join(this.appDir, 'tor', exe),
-    ].filter(Boolean);
-    for (const c of candidates) {
-      try { if (fs.statSync(c).isFile()) return c; } catch { /* нет файла */ }
-    }
-    return null;
-  }
-
-  // На Linux файл может оказаться без права на запуск (например, пакет собран
-  // под Windows) и лежать в каталоге только для чтения. Тогда копируем Tor
-  // в папку данных пользователя и запускаем оттуда.
-  _ensureExecutable(bin) {
-    if (process.platform === 'win32') return bin;
-    const srcDir = path.dirname(bin);
-    const check = (dir) => {
-      for (const rel of [path.basename(bin), path.join('pluggable_transports', 'lyrebird')]) {
-        const p = path.join(dir, rel);
-        if (fs.existsSync(p)) fs.accessSync(p, fs.constants.X_OK);
-      }
-    };
-    try { check(srcDir); return bin; } catch { /* нет права на запуск */ }
-    const chmodAll = (dir) => {
-      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-        const p = path.join(dir, e.name);
-        if (e.isDirectory()) chmodAll(p); else fs.chmodSync(p, 0o755);
-      }
-    };
-    try { chmodAll(srcDir); check(srcDir); return bin; } catch { /* каталог только для чтения */ }
-    const copyDir = path.join(path.dirname(this.dataDir), 'tor-bin');
-    fs.rmSync(copyDir, { recursive: true, force: true });
-    fs.cpSync(srcDir, copyDir, { recursive: true });
-    chmodAll(copyDir);
-    return path.join(copyDir, path.basename(bin));
-  }
-
-  start({ torPath, bridges } = {}) {
+  // paths: { tor, lyrebird, geoipDir } — из раскладки Tor Browser.
+  start(paths, { bridges, exitCountry, upstreamProxy } = {}) {
     if (this.proc) return;
-    const found = this.findBinary(torPath);
-    let bin = found;
-    if (!bin) {
-      this._set('missing', 'tor.exe не найден — положите Tor Expert Bundle в папку tor/ или укажите путь в настройках', 0);
+    if (!fs.existsSync(paths.tor)) {
+      this._set('error', 'Не найден файл Tor: ' + paths.tor, 0);
       return;
     }
     fs.mkdirSync(this.dataDir, { recursive: true });
+    try { fs.rmSync(this.cookieFile, { force: true }); } catch { /* не критично */ }
 
     const lines = [
       `SocksPort 127.0.0.1:${SOCKS_PORT}`,
       `ControlPort 127.0.0.1:${CONTROL_PORT}`,
       'CookieAuthentication 1',
+      `CookieAuthFile "${fwd(this.cookieFile)}"`,
       `DataDirectory "${fwd(this.dataDir)}"`,
     ];
-    const bundleRoot = path.dirname(path.dirname(found));
-    try { bin = this._ensureExecutable(found); } catch (e) {
-      this._set('error', 'Не удалось подготовить Tor к запуску: ' + e.message, 0);
-      return;
-    }
     for (const [opt, file] of [['GeoIPFile', 'geoip'], ['GeoIPv6File', 'geoip6']]) {
-      const p = path.join(bundleRoot, 'data', file);
+      const p = path.join(paths.geoipDir, file);
       if (fs.existsSync(p)) lines.push(`${opt} "${fwd(p)}"`);
     }
+
     const bridgeLines = String(bridges || '').split(/\r?\n/).map((l) => l.trim().replace(/^bridge\s+/i, '')).filter(Boolean);
     if (bridgeLines.length) {
-      const pt = path.join(path.dirname(bin), 'pluggable_transports', process.platform === 'win32' ? 'lyrebird.exe' : 'lyrebird');
       lines.push('UseBridges 1');
-      if (fs.existsSync(pt)) lines.push(`ClientTransportPlugin meek_lite,obfs4,scramblesuit,webtunnel exec "${fwd(pt)}"`);
+      if (fs.existsSync(paths.lyrebird)) lines.push(`ClientTransportPlugin meek_lite,obfs4,scramblesuit,webtunnel exec "${fwd(paths.lyrebird)}"`);
       for (const b of bridgeLines) lines.push(`Bridge ${b}`);
     }
+
+    if (/^[a-z]{2}$/i.test(exitCountry || '')) {
+      lines.push(`ExitNodes {${exitCountry.toLowerCase()}}`, 'StrictNodes 1');
+    }
+
+    // Прокси ПЕРЕД Tor: провайдер видит соединение с прокси, а не с сетью Tor.
+    const up = parseProxy(upstreamProxy);
+    if (up) {
+      const addr = `${up.host}:${up.port}`;
+      if (up.scheme === 'socks5') {
+        lines.push(`Socks5Proxy ${addr}`);
+        if (up.username) lines.push(`Socks5ProxyUsername ${up.username}`, `Socks5ProxyPassword ${up.password}`);
+      } else if (up.scheme === 'socks4') {
+        lines.push(`Socks4Proxy ${addr}`);
+      } else {
+        lines.push(`HTTPSProxy ${addr}`);
+        if (up.username) lines.push(`HTTPSProxyAuthenticator ${up.username}:${up.password}`);
+      }
+    }
+
     const torrc = path.join(this.dataDir, 'torrc');
     fs.writeFileSync(torrc, lines.join('\n') + '\n');
 
     this._set('starting', 'Запуск Tor…', 0);
     // Linux-сборка Tor несёт свои библиотеки (libevent, libssl) рядом с бинарником.
     const env = { ...process.env };
-    if (process.platform !== 'win32') env.LD_LIBRARY_PATH = [path.dirname(bin), env.LD_LIBRARY_PATH].filter(Boolean).join(':');
-    const proc = spawn(bin, ['-f', torrc], { windowsHide: true, env });
+    if (process.platform !== 'win32') env.LD_LIBRARY_PATH = [path.dirname(paths.tor), env.LD_LIBRARY_PATH].filter(Boolean).join(':');
+    const proc = spawn(paths.tor, ['-f', torrc], { windowsHide: true, env });
     this.proc = proc;
 
     let buf = '';
@@ -131,8 +106,8 @@ class TorManager extends EventEmitter {
           const pct = Number(m[1]);
           if (pct >= 100) { this._set('ready', 'Подключено', 100); this._watchStreams(); }
           else this._set('starting', m[2], pct);
-        } else if (/\[err\]/.test(line)) {
-          this.message = line.replace(/^.*\[err\]\s*/, '');
+        } else if (/\[(err|warn)\]/.test(line) && this.status !== 'ready') {
+          this.message = line.replace(/^.*\[(err|warn)\]\s*/, '');
           this.emit('change');
         }
       }
@@ -152,12 +127,20 @@ class TorManager extends EventEmitter {
     });
   }
 
-  // Подписка на события потоков: так мы знаем, по какой именно цепочке
-  // реально ушёл последний запрос, и показываем в схеме её, а не случайную.
+  stop() {
+    if (this.events) { this.events.destroy(); this.events = null; }
+    const proc = this.proc;
+    this.proc = null;
+    if (proc) { try { proc.kill(); } catch { /* уже завершён */ } }
+    this._set('stopped', '', 0);
+  }
+
+  // Подписка на события потоков: каждое соединение браузера сообщает, по какой
+  // цепочке оно ушло и к какому сайту. На этом строится схема маршрута.
   _watchStreams() {
     if (this.events) return;
     let cookie;
-    try { cookie = fs.readFileSync(path.join(this.dataDir, 'control_auth_cookie')).toString('hex'); } catch { return; }
+    try { cookie = fs.readFileSync(this.cookieFile).toString('hex'); } catch { return; }
     const sock = net.connect(CONTROL_PORT, '127.0.0.1');
     this.events = sock;
     let buf = '';
@@ -167,8 +150,10 @@ class TorManager extends EventEmitter {
       const lines = buf.split(/\r?\n/);
       buf = lines.pop();
       for (const line of lines) {
-        const m = line.match(/^650 STREAM \d+ SUCCEEDED (\d+) /);
-        if (m && m[1] !== '0') this.lastCircuitId = m[1];
+        // SENTCONNECT — момент, когда соединение отправлено по цепочке; здесь ещё
+        // виден домен сайта (в более поздних событиях он заменяется на IP).
+        const m = line.match(/^650 STREAM \d+ SENTCONNECT (\d+) (\S+)/);
+        if (m && m[1] !== '0' && !/\.exit:\d+$/.test(m[2])) this.emit('stream', { circuitId: m[1], target: m[2].replace(/:\d+$/, '') });
       }
     });
     const drop = () => { if (this.events === sock) this.events = null; };
@@ -176,18 +161,9 @@ class TorManager extends EventEmitter {
     sock.on('close', drop);
   }
 
-  stop() {
-    if (this.events) { this.events.destroy(); this.events = null; }
-    this.lastCircuitId = null;
-    const proc = this.proc;
-    this.proc = null;
-    if (proc) { try { proc.kill(); } catch { /* уже завершён */ } }
-    if (this.status !== 'missing') this._set('stopped', '', 0);
-  }
-
   // Отправляет команды на control-порт и возвращает сырой ответ Tor.
   control(commands) {
-    const cookie = fs.readFileSync(path.join(this.dataDir, 'control_auth_cookie')).toString('hex');
+    const cookie = fs.readFileSync(this.cookieFile).toString('hex');
     return new Promise((resolve, reject) => {
       const sock = net.connect(CONTROL_PORT, '127.0.0.1');
       let out = '';
@@ -202,84 +178,60 @@ class TorManager extends EventEmitter {
     });
   }
 
-  // Возвращает текущую цепочку: входной, промежуточный и выходной узлы с IP и
-  // страной. Если известен внешний IP, выбирается цепочка с таким выходом,
-  // иначе — самая свежая.
-  async circuit(exitIpHint) {
+  // Узлы цепочки с заданным номером: входной, промежуточный, выходной — с IP и страной.
+  async circuit(circuitId) {
     if (this.status !== 'ready') return null;
     const raw = await this.control(['GETINFO circuit-status']);
-    const circuits = [];
+    let hops = null;
     for (const line of raw.split(/\r?\n/)) {
-      const m = line.match(/^(\d+) BUILT (\S+) (.*)$/);
-      // CONFLUX_LINKED — «сдвоенные» цепочки новых версий Tor, обычный трафик часто идёт по ним.
-      if (!m || !/PURPOSE=(GENERAL|CONFLUX_LINKED)\b/.test(m[3])) continue;
-      const hops = m[2].split(',').map((h) => {
+      const m = line.match(/^(\d+) BUILT (\S+)/);
+      if (!m || m[1] !== String(circuitId)) continue;
+      hops = m[2].split(',').map((h) => {
         const [fp, nickname] = h.replace(/^\$/, '').split(/[~=]/);
-        return { fp, nickname: nickname || '' };
+        return { fp: fp.toUpperCase(), nickname: nickname || '' };
       });
-      if (hops.length < 3 || hops.some((h) => !/^[0-9A-F]{40}$/i.test(h.fp))) continue;
-      circuits.push({ id: m[1], hops, created: (m[3].match(/TIME_CREATED=(\S+)/) || [])[1] || '' });
     }
-    if (!circuits.length) return null;
+    if (!hops || hops.some((h) => !/^[0-9A-F]{40}$/.test(h.fp))) return null;
 
-    const fps = [...new Set(circuits.flatMap((c) => c.hops.map((h) => h.fp)))];
-    const ipByFp = {};
-    let current = null;
-    for (const line of (await this.control(fps.map((fp) => `GETINFO ns/id/${fp}`))).split(/\r?\n/)) {
-      const head = line.match(/ns\/id\/([0-9A-F]{40})=/i);
-      if (head) { current = head[1].toUpperCase(); continue; }
-      if (current && line.startsWith('r ')) {
-        const ip = line.split(' ').find((t) => /^\d{1,3}(\.\d{1,3}){3}$/.test(t));
-        if (ip) ipByFp[current] = ip;
-        current = null;
+    const unknown = hops.filter((h) => !this.relayCache.has(h.fp)).map((h) => h.fp);
+    if (unknown.length) {
+      const ipByFp = {};
+      let current = null;
+      const ns = await this.control(unknown.map((fp) => `GETINFO ns/id/${fp}`)).catch(() => '');
+      for (const line of ns.split(/\r?\n/)) {
+        const head = line.match(/ns\/id\/([0-9A-F]{40})=/i);
+        if (head) { current = head[1].toUpperCase(); continue; }
+        if (current && line.startsWith('r ')) {
+          const ip = line.split(' ').find((t) => /^\d{1,3}(\.\d{1,3}){3}$/.test(t));
+          if (ip) ipByFp[current] = ip;
+          current = null;
+        }
+      }
+      const ips = [...new Set(Object.values(ipByFp))];
+      const countryByIp = {};
+      if (ips.length) {
+        const out = await this.control(ips.map((ip) => `GETINFO ip-to-country/${ip}`)).catch(() => '');
+        for (const m of out.matchAll(/ip-to-country\/([\d.]+)=(\w+)/g)) {
+          if (m[2] !== '??') countryByIp[m[1]] = m[2].toUpperCase();
+        }
+      }
+      for (const fp of unknown) {
+        const ip = ipByFp[fp] || null;
+        // Мосты в общем списке узлов не значатся — их адрес остаётся неизвестным.
+        if (ip) this.relayCache.set(fp, { ip, country: countryByIp[ip] || null });
       }
     }
-
-    const ips = [...new Set(Object.values(ipByFp))];
-    const countryByIp = {};
-    if (ips.length) {
-      const out = await this.control(ips.map((ip) => `GETINFO ip-to-country/${ip}`)).catch(() => '');
-      for (const m of out.matchAll(/ip-to-country\/([\d.]+)=(\w+)/g)) {
-        if (m[2] !== '??') countryByIp[m[1]] = m[2].toUpperCase();
-      }
-    }
-
-    const withIps = circuits.map((c) => ({
-      ...c,
-      hops: c.hops.map((h) => {
-        const ip = ipByFp[h.fp.toUpperCase()] || null;
-        return { nickname: h.nickname, ip, country: (ip && countryByIp[ip]) || null };
-      }),
-    }));
-    const used = withIps.find((c) => c.id === this.lastCircuitId);
-    const byIp = exitIpHint && withIps.find((c) => c.hops[c.hops.length - 1].ip === exitIpHint);
-    const chosen = used || byIp || withIps.sort((a, b) => (a.created < b.created ? 1 : -1))[0];
-    return { exact: !!(used || byIp), hops: chosen.hops };
+    return hops.map((h) => ({ nickname: h.nickname, ...(this.relayCache.get(h.fp) || { ip: null, country: null }) }));
   }
 
-  // Просит Tor построить новые цепочки — следующий запрос пойдёт с другого IP.
+  // Просит Tor построить новые цепочки — следующие соединения пойдут с других IP.
   async newnym() {
     if (this.status !== 'ready') throw new Error('Tor ещё не подключён');
     // Tor сам ограничивает NEWNYM одним разом в ~10 секунд.
     const wait = this.lastNewnym + 10_000 - Date.now();
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    const cookie = fs.readFileSync(path.join(this.dataDir, 'control_auth_cookie')).toString('hex');
-    await new Promise((resolve, reject) => {
-      const sock = net.connect(CONTROL_PORT, '127.0.0.1');
-      let out = '';
-      const timer = setTimeout(() => { sock.destroy(); reject(new Error('Tor не ответил на control-порту')); }, 5000);
-      sock.on('connect', () => sock.write(`AUTHENTICATE ${cookie}\r\nSIGNAL NEWNYM\r\nQUIT\r\n`));
-      sock.on('data', (d) => { out += d.toString(); });
-      sock.on('error', (e) => { clearTimeout(timer); reject(e); });
-      sock.on('close', () => {
-        clearTimeout(timer);
-        const ok = (out.match(/^250 OK/gm) || []).length >= 2;
-        ok ? resolve() : reject(new Error('Tor отклонил команду: ' + out.trim().split(/\r?\n/)[0]));
-      });
-    });
+    await this.control(['SIGNAL NEWNYM']);
     this.lastNewnym = Date.now();
-    // Даём Tor секунду на постройку новой цепочки.
-    await new Promise((r) => setTimeout(r, 1500));
   }
 }
 
