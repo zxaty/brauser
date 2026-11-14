@@ -1,0 +1,79 @@
+{
+  "name": "brauser",
+  "productName": "Brauser",
+  "version": "0.1.0",
+  "description": "Приватный браузер: подмена отпечатка, Tor и ротация прокси",
+  "author": {
+    "name": "Brauser",
+    "email": "brauser@localhost"
+  },
+  "main": "src/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "selftest": "electron . --selftest",
+    "selftest:tor": "electron . --selftest --tor",
+    "dist": "electron-builder --win nsis --x64",
+    "dist:linux": "sh scripts/build-linux.sh",
+    "dist:linux:docker": "pwsh -NoProfile -File scripts/build-linux.ps1"
+  },
+  "build": {
+    "appId": "local.brauser.app",
+    "productName": "Brauser",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "extraResources": [
+        {
+          "from": "tor",
+          "to": "tor"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "Brauser-Setup-${version}.exe",
+      "shortcutName": "Brauser"
+    },
+    "linux": {
+      "target": "deb",
+      "category": "Network",
+      "executableName": "brauser",
+      "synopsis": "Приватный браузер с Tor и подменой отпечатка",
+      "artifactName": "brauser_${version}_${arch}.${ext}",
+      "extraResources": [
+        {
+          "from": "tor-linux",
+          "to": "tor"
+        }
+      ]
+    },
+    "deb": {
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xdg-utils",
+        "libatspi2.0-0",
+        "libuuid1",
+        "libsecret-1-0",
+        "libasound2t64 | libasound2",
+        "libgbm1"
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "^45.3.2",
+    "electron-builder": "^26.18.0"
+  },
+  "homepage": "https://brauser.invalid"
+}

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; form-action https://duckduckgo.com">
+  <title>Новая вкладка</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body {
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px;
+      background: #14161a; color: #e6e8ec; font: 15px/1.4 "Segoe UI", system-ui, sans-serif;
+    }
+    h1 { margin: 0; font-size: 34px; font-weight: 600; letter-spacing: .02em; }
+    form { width: min(560px, 80vw); }
+    input {
+      width: 100%; box-sizing: border-box; height: 46px; padding: 0 20px;
+      background: #1c1f25; color: inherit; font: inherit; border: 1px solid #333843; border-radius: 23px; outline: none;
+    }
+    input:focus { border-color: #4f8cff; }
+    p { margin: 0; color: #8d94a1; font-size: 13px; }
+    footer { position: fixed; bottom: 18px; color: #5d6470; font-size: 12px; letter-spacing: .06em; }
+  </style>
+</head>
+<body>
+  <h1>Brauser</h1>
+  <form action="https://duckduckgo.com/" method="get">
+    <input name="q" type="text" autofocus autocomplete="off" placeholder="Поиск в DuckDuckGo">
+  </form>
+  <p>Куки и история живут только до смены личности или закрытия браузера.</p>
+  <footer>Barathrum Co. · pulpadulpa</footer>
+</body>
+</html>
